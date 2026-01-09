@@ -1,0 +1,23 @@
+services:
+  cc-agent-sdk:
+    build: .
+    container_name: cc-agent-sdk
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+      - AGENT_SDK_FIRST_OUTPUT_TIMEOUT_MS=${AGENT_SDK_FIRST_OUTPUT_TIMEOUT_MS:-30000}
+      - WORK_DIR=/workspace
+      - SKILLS_DIR=/app/skills
+    volumes:
+      - ./workspace:/workspace
+      - ./skills:/app/skills
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

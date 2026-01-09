@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__mcp-deepwiki__deepwiki_fetch",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "mcp__mcp-feedback-enhanced__interactive_feedback",
+      "Bash(uv run python:*)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(cat:*)",
+      "Bash(gh repo view:*)",
+      "Bash(find:*)",
+      "mcp__auggie-mcp__codebase-retrieval",
+      "Bash(pkill:*)",
+      "Bash(timeout 15 curl:*)",
+      "Bash(tee:*)",
+      "Bash(chmod:*)",
+      "Bash(/tmp/test_api.sh)",
+      "Bash(bash:*)",
+      "Bash(timeout 130 /tmp/full_test.sh:*)",
+      "Bash(/tmp/full_test.sh)",
+      "Bash(time /tmp/test_api.sh:*)",
+      "Bash(/tmp/test_empty_settings.sh:*)",
+      "Bash(/tmp/test_project_only.sh)"
+    ]
+  }
+}
