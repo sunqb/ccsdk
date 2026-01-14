@@ -95,6 +95,16 @@ class StreamRequest(BaseModel):
         None,
         description="工作目录"
     )
+    result_mode: Optional[str] = Field(
+        None,
+        alias="resultMode",
+        description="SSE 的 result(success) 事件输出模式：full|empty|none（默认读取 AGENT_SDK_STREAM_RESULT_MODE）"
+    )
+    event_mode: Optional[str] = Field(
+        None,
+        alias="eventMode",
+        description="SSE 事件输出模式：full|text_only（默认读取 AGENT_SDK_STREAM_EVENT_MODE）"
+    )
 
     class Config:
         populate_by_name = True

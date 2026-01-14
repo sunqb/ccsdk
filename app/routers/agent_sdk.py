@@ -9,6 +9,7 @@ from ..models.request import StreamRequest, HistoryRequest
 from ..services.agent import agent_service
 from ..services.history import history_service
 from ..auth import verify_api_key
+from ..config import settings
 
 router = APIRouter(prefix="/agent-sdk", tags=["Agent SDK"])
 
@@ -24,12 +25,18 @@ async def _generate_sse_stream(
     cwd: Optional[str],
     model: Optional[str] = None,
     base_url: Optional[str] = None,
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    result_mode: Optional[str] = None,
+    event_mode: str = "full",
 ) -> AsyncGenerator[str, None]:
     """生成 SSE 事件流"""
     # 默认工具列表：空列表表示使用 SDK 默认工具（完整工具集）
     # 如果用户明确传递 ["Skill"]，则只允许 Skill
     tools = allowed_tools if allowed_tools is not None else None
+
+    effective_event_mode = (event_mode or "full").strip().lower()
+    if effective_event_mode not in ("full", "text_only"):
+        effective_event_mode = "full"
 
     async for event in agent_service.query_stream(
         prompt=prompt,
@@ -42,9 +49,20 @@ async def _generate_sse_stream(
         cwd=cwd,
         model=model,
         base_url=base_url,
-        api_key=api_key
+        api_key=api_key,
+        result_mode=result_mode,
     ):
-        yield event.to_sse()
+        if effective_event_mode == "full":
+            yield event.to_sse()
+            continue
+
+        # text_only：仅输出 text_delta，并保留 end/error 作为结束与异常信号
+        if event.type == "content_block_delta" and event.subtype == "text_delta":
+            yield event.to_sse()
+        elif event.type == "stream_event" and event.subtype == "end":
+            yield event.to_sse()
+        elif event.type == "error":
+            yield event.to_sse()
 
 
 @router.post("/stream", dependencies=[Depends(verify_api_key)])
@@ -98,6 +116,15 @@ async def agent_sdk_stream(request: StreamRequest):
             # 预设配置，转换为字符串
             system_prompt = str(request.system_prompt)
 
+    event_mode = (request.event_mode or settings.agent_sdk_stream_event_mode or "full").strip().lower()
+    if event_mode not in ("full", "text_only"):
+        event_mode = "full"
+
+    # text_only 模式：默认不输出最终 result 全量（避免重复/浪费带宽）
+    result_mode = request.result_mode
+    if event_mode == "text_only":
+        result_mode = "none"
+
     return StreamingResponse(
         _generate_sse_stream(
             prompt=prompt,
@@ -110,7 +137,9 @@ async def agent_sdk_stream(request: StreamRequest):
             cwd=request.cwd,
             model=request.model,
             base_url=request.base_url,
-            api_key=request.api_key
+            api_key=request.api_key,
+            result_mode=result_mode,
+            event_mode=event_mode,
         ),
         media_type="text/event-stream",
         headers={

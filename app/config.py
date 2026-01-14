@@ -13,12 +13,17 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent.parent / ".env"
 loaded = load_dotenv(env_path, override=True)
 
+def _secret_status(value: str | None) -> str:
+    if not value:
+        return "None"
+    return f"set(len={len(value)})"
+
 print("="*50)
 print(f"[Config] 加载 .env 文件: {env_path}")
 print(f"[Config] .env 文件存在: {env_path.exists()}")
 print(f"[Config] load_dotenv 返回: {loaded}")
-print(f"[Config] ANTHROPIC_API_KEY: {os.getenv('ANTHROPIC_API_KEY', 'None')[:20] if os.getenv('ANTHROPIC_API_KEY') else 'None'}...")
-print(f"[Config] ANTHROPIC_AUTH_TOKEN: {os.getenv('ANTHROPIC_AUTH_TOKEN', 'None')[:20] if os.getenv('ANTHROPIC_AUTH_TOKEN') else 'None'}...")
+print(f"[Config] ANTHROPIC_API_KEY: {_secret_status(os.getenv('ANTHROPIC_API_KEY'))}")
+print(f"[Config] ANTHROPIC_AUTH_TOKEN: {_secret_status(os.getenv('ANTHROPIC_AUTH_TOKEN'))}")
 print(f"[Config] ANTHROPIC_BASE_URL: {os.getenv('ANTHROPIC_BASE_URL', 'None')}")
 print(f"[Config] ANTHROPIC_MODEL: {os.getenv('ANTHROPIC_MODEL', 'None')}")
 print(f"[Config] WORK_DIR: {os.getenv('WORK_DIR', 'None')}")
@@ -51,6 +56,19 @@ class Settings:
     )
     agent_sdk_port: int = field(
         default_factory=lambda: int(os.getenv("AGENT_SDK_PORT", "8000"))
+    )
+    # /agent-sdk/stream 最终 result 事件输出模式：
+    # - full: 输出完整 result 文本（默认，兼容原行为）
+    # - empty: 输出空字符串
+    # - none: 不输出 result(success) 事件（仅依赖 SSE 断开或 end 事件判断结束）
+    agent_sdk_stream_result_mode: str = field(
+        default_factory=lambda: os.getenv("AGENT_SDK_STREAM_RESULT_MODE", "full")
+    )
+    # /agent-sdk/stream 事件输出模式：
+    # - full: 完整事件流（默认，尽量与 claude-agent-sdk/Claude Code CLI 保持一致）
+    # - text_only: 仅输出 content_block_delta/text_delta（并保留 end/error）
+    agent_sdk_stream_event_mode: str = field(
+        default_factory=lambda: os.getenv("AGENT_SDK_STREAM_EVENT_MODE", "full")
     )
 
     # 服务配置

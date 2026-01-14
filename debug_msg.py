@@ -5,8 +5,12 @@
 import os
 import asyncio
 
-os.environ["ANTHROPIC_API_KEY"] = "sk-OXmyvA1RKvpCIMSABio4WkkWJWuKhoIIRqO3QFEtDCQX8ZII"
-os.environ["ANTHROPIC_BASE_URL"] = "https://api.dev88.tech"
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+
+if not ANTHROPIC_API_KEY:
+    raise SystemExit("缺少 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN")
 
 async def debug_messages():
     from claude_agent_sdk import query, ClaudeAgentOptions
@@ -16,10 +20,11 @@ async def debug_messages():
         allowed_tools=["Read"],
         setting_sources=[],
         env={
-            "ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"],
-            "ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"],
+            "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+            **({"ANTHROPIC_BASE_URL": ANTHROPIC_BASE_URL} if ANTHROPIC_BASE_URL else {}),
         },
-        model="claude-sonnet-4-5-20250929",
+        model=ANTHROPIC_MODEL,
+        include_partial_messages=True,
     )
 
     print("开始调试消息结构...")

@@ -61,6 +61,7 @@ class AgentService:
         model: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        result_mode: Optional[str] = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """
         流式查询 Claude Agent
@@ -114,7 +115,8 @@ class AgentService:
                     setting_sources=setting_sources,
                     model=model,
                     base_url=base_url,
-                    api_key=api_key
+                    api_key=api_key,
+                    result_mode=result_mode,
                 ):
                     yield event
             else:
@@ -143,7 +145,8 @@ class AgentService:
         setting_sources: Optional[list[str]] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        result_mode: Optional[str] = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """使用 Claude Agent SDK 执行查询"""
         from claude_agent_sdk import query, ClaudeAgentOptions
@@ -184,7 +187,7 @@ class AgentService:
         logger.info(f"  prompt: {prompt[:100]}...")
         logger.info(f"  system_prompt: {system_prompt[:200] if system_prompt else 'None'}...")
         logger.info(f"  allowed_tools: {allowed_tools}")
-        logger.info(f"  effective_api_key: {effective_api_key[:20] if effective_api_key else 'None'}...")
+        logger.info(f"  effective_api_key: {'set' if effective_api_key else 'None'}")
         logger.info(f"  effective_base_url: {effective_base_url}")
         logger.info(f"  effective_model: {effective_model}")
         logger.info(f"  work_dir: {settings.work_dir}")
@@ -204,7 +207,21 @@ class AgentService:
             model=effective_model,
             # 权限模式：bypassPermissions 跳过交互式权限确认
             permission_mode="bypassPermissions",
+            # 关键：开启 partial messages，Claude Code CLI 才会输出逐 token 的 stream_event
+            # 否则 SDK 只会在 AssistantMessage 完整生成后一次性返回 TextBlock，导致“假流式”
+            include_partial_messages=True,
         )
+
+        effective_result_mode = (
+            (result_mode or settings.agent_sdk_stream_result_mode or "full")
+            .strip()
+            .lower()
+        )
+        if effective_result_mode not in ("full", "empty", "none"):
+            logger.warning(
+                f"Unknown result_mode '{effective_result_mode}', fallback to 'full'"
+            )
+            effective_result_mode = "full"
 
         if max_turns:
             options.max_turns = max_turns
@@ -222,6 +239,7 @@ class AgentService:
             options.resume = session.metadata["resume_id"]
 
         result_text = ""
+        streamed_any_text_delta = False
 
         try:
             async for message in query(prompt=prompt, options=options):
@@ -229,14 +247,42 @@ class AgentService:
                 msg_class = type(message).__name__
                 logger.debug(f"Received message: {msg_class}")
 
+                if msg_class == "StreamEvent":
+                    raw_event = getattr(message, "event", None)
+                    if not isinstance(raw_event, dict):
+                        continue
+
+                    # Claude Code CLI 透传的 Anthropic Messages API stream events
+                    # 重点处理 text_delta，其余事件按需扩展
+                    if raw_event.get("type") == "content_block_delta":
+                        delta = raw_event.get("delta") or {}
+                        if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                streamed_any_text_delta = True
+                                if effective_result_mode == "full":
+                                    result_text += text
+                                yield AgentEvent(
+                                    type="content_block_delta",
+                                    subtype="text_delta",
+                                    data={"text": text},
+                                    conversation_id=session.id
+                                )
+                    continue
+
                 if msg_class == "AssistantMessage":
                     # 处理助手消息
                     content = getattr(message, "content", [])
                     for block in content:
                         block_type = type(block).__name__
                         if block_type == "TextBlock":
+                            # 开启 partial messages 后，TextBlock 会在消息完成时一次性返回全文，
+                            # 若已通过 StreamEvent 输出过 text_delta，则跳过以避免重复
+                            if streamed_any_text_delta:
+                                continue
                             text = getattr(block, "text", "")
-                            result_text += text
+                            if effective_result_mode == "full":
+                                result_text += text
                             yield AgentEvent(
                                 type="content_block_delta",
                                 subtype="text_delta",
@@ -265,12 +311,27 @@ class AgentService:
                         if session_id:
                             session.metadata["resume_id"] = session_id
 
-                        yield AgentEvent(
-                            type="result",
-                            subtype="success",
-                            data={"result": result or result_text},
-                            conversation_id=session.id
-                        )
+                        if effective_result_mode == "none":
+                            yield AgentEvent(
+                                type="stream_event",
+                                subtype="end",
+                                data={"message": "Query finished"},
+                                conversation_id=session.id
+                            )
+                        elif effective_result_mode == "empty":
+                            yield AgentEvent(
+                                type="result",
+                                subtype="success",
+                                data={"result": ""},
+                                conversation_id=session.id
+                            )
+                        else:
+                            yield AgentEvent(
+                                type="result",
+                                subtype="success",
+                                data={"result": result or result_text},
+                                conversation_id=session.id
+                            )
                     else:
                         is_error = getattr(message, "is_error", False)
                         result = getattr(message, "result", "Unknown error")

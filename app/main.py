@@ -84,5 +84,7 @@ async def get_config():
         "workDir": settings.work_dir,
         "skillsDir": settings.skills_dir,
         "defaultAllowedTools": settings.default_allowed_tools,
-        "firstOutputTimeoutMs": settings.agent_sdk_first_output_timeout_ms
+        "firstOutputTimeoutMs": settings.agent_sdk_first_output_timeout_ms,
+        "streamResultMode": settings.agent_sdk_stream_result_mode,
+        "streamEventMode": settings.agent_sdk_stream_event_mode,
     }

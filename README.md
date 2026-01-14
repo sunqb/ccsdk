@@ -181,12 +181,18 @@ curl -X POST http://localhost:8000/agent-sdk/stream \
   "cwd": "/path/to/project",
   "settingSources": ["project"],
   "model": "claude-sonnet-4-5-20250929",
+  "resultMode": "full",
+  "eventMode": "full",
   "options": {
     "allowedTools": null,
     "maxTurns": 10
   }
 }
 ```
+
+**可选参数说明：**
+- `eventMode=full`：输出完整事件流（默认，尽量与 Claude Code CLI/SDK 保持一致）
+- `eventMode=text_only`：仅输出 `content_block_delta/text_delta`（并保留 `stream_event/end` 与 `error`）；该模式下服务会强制 `resultMode=none`，避免最后的全量 `result`
 
 **响应 (text/event-stream):**
 ```
@@ -208,6 +214,8 @@ data: {"type": "result", "subtype": "success", "data": {"result": "..."}, "conve
 | `ANTHROPIC_BASE_URL` | API Base URL | - | 否 |
 | `ANTHROPIC_MODEL` | 使用的模型 | `claude-sonnet-4-5-20250929` | 否 |
 | `AGENT_SDK_API_KEY` | API 认证密钥 | - | 否 |
+| `AGENT_SDK_STREAM_RESULT_MODE` | `/agent-sdk/stream` 的 result(success) 输出模式：`full|empty|none` | `full` | 否 |
+| `AGENT_SDK_STREAM_EVENT_MODE` | `/agent-sdk/stream` 的事件输出模式：`full|text_only` | `full` | 否 |
 | `HOST` | 服务监听地址 | `0.0.0.0` | 否 |
 | `PORT` | 服务监听端口 | `8000` | 否 |
 | `WORK_DIR` | 工作目录 | 当前目录 | 否 |
