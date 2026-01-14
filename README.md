@@ -205,6 +205,14 @@ data: {"type": "content_block_delta", "subtype": "text_delta", "data": {"text": 
 data: {"type": "result", "subtype": "success", "data": {"result": "..."}, "conversationId": "xxx"}
 ```
 
+### 会话（新建 / 继续 / 历史）
+
+- **新建会话**：不传 `conversationId`（或传一个全新的 ID），服务会创建新会话
+- **继续会话**：后续请求复用同一个 `conversationId`
+- **查询历史**：调用 `GET /agent-sdk/history?conversationId=...`
+  - Claude Code 的历史文件名是其内部 `session_id`（位于 `stream_event/init.data.session_id`，或可通过 `GET /agent-sdk/conversations` 列出）
+  - 本服务也支持用“本服务的 conversationId”查询历史（会在进程内存中映射到 `session_id`）；若服务重启，需直接使用 Claude Code 的 `session_id`
+
 ## 环境变量
 
 | 变量名 | 描述 | 默认值 | 必填 |

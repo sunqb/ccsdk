@@ -8,6 +8,7 @@ from typing import AsyncGenerator, Optional
 from ..models.request import StreamRequest, HistoryRequest
 from ..services.agent import agent_service
 from ..services.history import history_service
+from ..services.session import session_manager
 from ..auth import verify_api_key
 from ..config import settings
 
@@ -178,13 +179,33 @@ async def get_history(
     - includeThinking: 可选，是否包含 thinking 块（默认 false）
     - raw: 可选，返回完整事件数组（默认 false）
     """
-    return history_service.get_history(
+    result = history_service.get_history(
         conversation_id=conversation_id,
         offset=offset,
         limit=limit,
         include_thinking=include_thinking,
         raw=raw
     )
+
+    # 兼容：若用户传入的是本服务的 conversationId（内存会话ID），尝试映射到 Claude Code 的 session_id
+    # 注意：该映射依赖进程内存；服务重启后需要直接使用 Claude Code 的 session_id（.jsonl 文件名）
+    if result.get("error") == "Conversation not found":
+        session = await session_manager.get_session(conversation_id)
+        resume_id = session.metadata.get("resume_id") if session else None
+        if isinstance(resume_id, str) and resume_id:
+            resolved = history_service.get_history(
+                conversation_id=resume_id,
+                offset=offset,
+                limit=limit,
+                include_thinking=include_thinking,
+                raw=raw
+            )
+            if resolved.get("error") != "Conversation not found":
+                resolved["requestedConversationId"] = conversation_id
+                resolved["resolvedConversationId"] = resume_id
+                return resolved
+
+    return result
 
 
 @router.get("/projects", dependencies=[Depends(verify_api_key)])
