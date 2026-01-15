@@ -71,6 +71,26 @@ class Settings:
         default_factory=lambda: os.getenv("AGENT_SDK_STREAM_EVENT_MODE", "full")
     )
 
+    # 通过代码注入 Claude Code CLI settings / MCP（无需写 .claude/settings.json）
+    # 说明：
+    # - AGENT_SDK_ADDITIONAL_SETTINGS_JSON：JSON 字符串，将作为 `claude --settings <json>` 的“附加 settings”注入
+    # - AGENT_SDK_PERMISSIONS_ALLOW：逗号分隔的 allow 规则，自动合并进 additional settings 的 permissions.allow
+    # - AGENT_SDK_MCP_SERVERS_JSON：JSON 字符串，形如 {"search": {"type":"sse","url":"..."}}
+    # - AGENT_SDK_STRICT_MCP_CONFIG：为 1/true 时，传递 `--strict-mcp-config`
+    agent_sdk_additional_settings_json: Optional[str] = field(
+        default_factory=lambda: os.getenv("AGENT_SDK_ADDITIONAL_SETTINGS_JSON")
+    )
+    agent_sdk_permissions_allow: Optional[str] = field(
+        default_factory=lambda: os.getenv("AGENT_SDK_PERMISSIONS_ALLOW")
+    )
+    agent_sdk_mcp_servers_json: Optional[str] = field(
+        default_factory=lambda: os.getenv("AGENT_SDK_MCP_SERVERS_JSON")
+    )
+    agent_sdk_strict_mcp_config: bool = field(
+        default_factory=lambda: os.getenv("AGENT_SDK_STRICT_MCP_CONFIG", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
     # 服务配置
     host: str = field(default_factory=lambda: os.getenv("HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8000")))

@@ -213,6 +213,35 @@ data: {"type": "result", "subtype": "success", "data": {"result": "..."}, "conve
   - Claude Code 的历史文件名是其内部 `session_id`（位于 `stream_event/init.data.session_id`，或可通过 `GET /agent-sdk/conversations` 列出）
   - 本服务也支持用“本服务的 conversationId”查询历史（会在进程内存中映射到 `session_id`）；若服务重启，需直接使用 Claude Code 的 `session_id`
 
+### MCP（可选：接入搜索等外部工具）
+
+Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
+
+1) 在 **Claude Code 可加载的 settings** 里配置 `mcpServers`（推荐放在项目下，随 `cwd` 生效）  
+2) 确保请求的 `settingSources` 覆盖到你放置 settings 的来源（`project/user/local`）  
+3) 不要把 `options.allowedTools` 限制到排除 MCP（或把对应 `mcp__<server>__<tool>` 加进去）
+
+**示例：在 `./.claude/settings.json` 配置一个 stdio MCP server（以“搜索类 server”为例，command/args 请以该 server 文档为准）**
+```json
+{
+  "mcpServers": {
+    "search": {
+      "command": "npx",
+      "args": ["-y", "<mcp-server-package>"],
+      "env": {
+        "API_KEY": "从环境变量或明文填写"
+      }
+    }
+  }
+}
+```
+
+**如果你把配置写在 `./.claude/settings.local.json`（不建议提交到 git）**  
+请求里请传：`"settingSources": ["project", "local"]`
+
+**验证是否生效**  
+调用 `/agent-sdk/stream`，看 `stream_event/init` 事件里的 `mcp_servers` 是否出现你的 server 名称；同时 `tools` 列表里会出现形如 `mcp__search__xxx` 的工具名。
+
 ## 环境变量
 
 | 变量名 | 描述 | 默认值 | 必填 |
@@ -224,6 +253,10 @@ data: {"type": "result", "subtype": "success", "data": {"result": "..."}, "conve
 | `AGENT_SDK_API_KEY` | API 认证密钥 | - | 否 |
 | `AGENT_SDK_STREAM_RESULT_MODE` | `/agent-sdk/stream` 的 result(success) 输出模式：`full|empty|none` | `full` | 否 |
 | `AGENT_SDK_STREAM_EVENT_MODE` | `/agent-sdk/stream` 的事件输出模式：`full|text_only` | `full` | 否 |
+| `AGENT_SDK_ADDITIONAL_SETTINGS_JSON` | 通过代码注入 `claude --settings <json>` 的附加 settings（JSON 字符串） | - | 否 |
+| `AGENT_SDK_PERMISSIONS_ALLOW` | 逗号分隔的 `permissions.allow` 规则（会合并进 additional settings） | - | 否 |
+| `AGENT_SDK_MCP_SERVERS_JSON` | 通过代码注入 MCP servers（JSON 字符串，形如 `{\"search\": {\"type\":\"sse\",\"url\":\"...\"}}`） | - | 否 |
+| `AGENT_SDK_STRICT_MCP_CONFIG` | 仅使用注入的 MCP（传 `--strict-mcp-config`），`1/true` 启用 | - | 否 |
 | `HOST` | 服务监听地址 | `0.0.0.0` | 否 |
 | `PORT` | 服务监听端口 | `8000` | 否 |
 | `WORK_DIR` | 工作目录 | 当前目录 | 否 |
