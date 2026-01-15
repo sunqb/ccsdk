@@ -4,6 +4,8 @@ Agent 服务 - 核心 Claude Agent SDK 封装
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from typing import Optional, Any, AsyncGenerator
 from dataclasses import dataclass
 
@@ -166,8 +168,27 @@ class AgentService:
 
         # 构建环境变量，传递 API 配置
         # 继承当前进程的所有环境变量
-        import os
         env = dict(os.environ)
+        # 避免 Claude Code CLI 在 macOS 上对 VS Code 的 IPC socket / named pipe 做 fs.watch 导致崩溃
+        # macOS 不支持对命名管道 (named pipe/FIFO) 进行文件系统监视，会抛出 EOPNOTSUPP 错误
+        env.pop("VSCODE_GIT_IPC_HANDLE", None)
+        env.pop("VSCODE_IPC_HOOK", None)
+        env.pop("VSCODE_IPC_HOOK_CLI", None)
+        env.pop("VSCODE_IPC_HOOK_EXTHOST", None)
+        # 移除 Electron 相关环境变量，避免 Claude Code CLI 继承 VS Code 的 Electron 上下文
+        # 这可能导致 CLI 错误地尝试监视 CEF (Chromium Embedded Framework) 的 socket 文件
+        env.pop("ELECTRON_RUN_AS_NODE", None)
+        env.pop("ELECTRON_NO_ASAR", None)
+        # 强制使用轮询模式进行文件监视，避免 macOS 对特殊文件类型的 fs.watch 限制
+        env["CHOKIDAR_USEPOLLING"] = "true"
+        env["WATCHPACK_POLLING"] = "true"
+        # 使用独立的临时目录，避免与 VS Code/CEF 的 socket 文件冲突
+        # 这可以防止 Claude Code CLI 意外扫描到 CEF 创建的 client_pipe_* 文件
+        claude_tmp_dir = os.path.join(tempfile.gettempdir(), "claude_agent_sdk")
+        os.makedirs(claude_tmp_dir, exist_ok=True)
+        env["TMPDIR"] = claude_tmp_dir
+        env["TEMP"] = claude_tmp_dir
+        env["TMP"] = claude_tmp_dir
 
         # 覆盖 API 配置
         if effective_api_key:
@@ -198,6 +219,61 @@ class AgentService:
         # - "project": {cwd}/.claude/ 配置（加载 skills）
         # 默认只加载项目配置
         effective_setting_sources = setting_sources if setting_sources is not None else ["project"]
+
+        # 代码注入：附加 settings（permissions 等）与 MCP servers
+        injected_settings: dict[str, Any] = {}
+        if settings.agent_sdk_additional_settings_json:
+            try:
+                parsed = json.loads(settings.agent_sdk_additional_settings_json)
+                if isinstance(parsed, dict):
+                    injected_settings = parsed
+                else:
+                    logger.warning("AGENT_SDK_ADDITIONAL_SETTINGS_JSON must be a JSON object")
+            except Exception as e:
+                logger.warning(f"Invalid AGENT_SDK_ADDITIONAL_SETTINGS_JSON: {e}")
+
+        if settings.agent_sdk_permissions_allow:
+            allow_items = [
+                item.strip()
+                for item in settings.agent_sdk_permissions_allow.split(",")
+                if item.strip()
+            ]
+            if allow_items:
+                perms = injected_settings.setdefault("permissions", {})
+                if not isinstance(perms, dict):
+                    perms = {}
+                    injected_settings["permissions"] = perms
+                existing_allow = perms.get("allow", [])
+                if not isinstance(existing_allow, list):
+                    existing_allow = []
+                # 去重但保持顺序
+                combined = list(existing_allow)
+                for item in allow_items:
+                    if item not in combined:
+                        combined.append(item)
+                perms["allow"] = combined
+
+        injected_settings_str = (
+            json.dumps(injected_settings, ensure_ascii=False)
+            if injected_settings
+            else None
+        )
+
+        injected_mcp_servers: Any = None
+        if settings.agent_sdk_mcp_servers_json:
+            try:
+                parsed = json.loads(settings.agent_sdk_mcp_servers_json)
+                if isinstance(parsed, dict) and "mcpServers" in parsed and isinstance(parsed["mcpServers"], dict):
+                    injected_mcp_servers = parsed["mcpServers"]
+                else:
+                    injected_mcp_servers = parsed
+            except Exception as e:
+                logger.warning(f"Invalid AGENT_SDK_MCP_SERVERS_JSON: {e}")
+
+        extra_args: dict[str, str | None] = {}
+        if settings.agent_sdk_strict_mcp_config:
+            extra_args["strict-mcp-config"] = None
+
         options = ClaudeAgentOptions(
             cwd=session.cwd or settings.work_dir,
             allowed_tools=allowed_tools,
@@ -210,6 +286,9 @@ class AgentService:
             # 关键：开启 partial messages，Claude Code CLI 才会输出逐 token 的 stream_event
             # 否则 SDK 只会在 AssistantMessage 完整生成后一次性返回 TextBlock，导致“假流式”
             include_partial_messages=True,
+            settings=injected_settings_str,
+            mcp_servers=injected_mcp_servers or {},
+            extra_args=extra_args,
         )
 
         effective_result_mode = (
