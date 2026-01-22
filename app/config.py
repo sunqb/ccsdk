@@ -106,8 +106,10 @@ class Settings:
     )
 
     # 默认允许的工具
+    # 说明：为了避免“只想要代码展示”却在服务器上落盘生成文件，默认禁用 Write/Bash。
+    # 如需允许写文件，应由上层显式传入 allowed_tools/disallowed_tools 进行放开。
     default_allowed_tools: list[str] = field(
-        default_factory=lambda: ["Skill", "Read", "Write", "Bash", "Glob", "Grep"]
+        default_factory=lambda: ["Skill", "Read", "Glob", "Grep"]
     )
 
 

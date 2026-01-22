@@ -8,6 +8,7 @@ import os
 import tempfile
 from typing import Optional, Any, AsyncGenerator
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..config import settings
 from .session import session_manager, Session
@@ -36,6 +37,40 @@ class AgentEvent:
     def to_sse(self) -> str:
         """转换为 SSE 格式"""
         return f"data: {json.dumps(self.to_dict(), ensure_ascii=False)}\n\n"
+
+
+PROJECT_CLAUDE_MD_RELATIVE_PATH = ".claude/CLAUDE.md"
+
+# 全局强制禁用写入/执行类工具（服务端安全模式）
+GLOBAL_DISALLOWED_TOOLS = ["Write", "Bash"]
+
+
+def _load_project_claude_md(cwd: str | None) -> str:
+    """读取项目级 .claude/CLAUDE.md，用于注入系统约束。"""
+    if not cwd:
+        return ""
+    try:
+        file_path = Path(cwd) / PROJECT_CLAUDE_MD_RELATIVE_PATH
+        if not file_path.exists() or not file_path.is_file():
+            return ""
+        return file_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _merge_system_prompts(user_system_prompt: str | None, project_claude_md: str) -> str | None:
+    """合并用户 systemPrompt 与项目级 CLAUDE.md（以项目约束为准）。"""
+    project_part = (project_claude_md or "").strip()
+    user_part = (user_system_prompt or "").strip()
+
+    if not project_part and not user_part:
+        return None
+    if not project_part:
+        return user_part
+    if not user_part:
+        return project_part
+
+    return f"{user_part}\n\n---\n\n{project_part}"
 
 
 class AgentService:
@@ -97,6 +132,18 @@ class AgentService:
         # 空列表或明确指定的列表则使用用户指定的
         tools = allowed_tools
 
+        # 全局安全模式：强制禁用写入/执行类工具，避免在服务器落盘或执行任意命令
+        effective_disallowed_tools: list[str] = []
+        if disallowed_tools:
+            effective_disallowed_tools.extend(disallowed_tools)
+        for tool_name in GLOBAL_DISALLOWED_TOOLS:
+            if tool_name not in effective_disallowed_tools:
+                effective_disallowed_tools.append(tool_name)
+
+        # 注入项目级 .claude/CLAUDE.md 作为系统约束（不写死在代码里，便于调整）
+        project_claude_md = _load_project_claude_md(session.cwd or settings.work_dir)
+        effective_system_prompt = _merge_system_prompts(system_prompt, project_claude_md)
+
         try:
             # 尝试导入 claude_agent_sdk
             try:
@@ -111,9 +158,9 @@ class AgentService:
                     prompt=prompt,
                     session=session,
                     allowed_tools=tools,
-                    disallowed_tools=disallowed_tools,
+                    disallowed_tools=effective_disallowed_tools,
                     max_turns=max_turns,
-                    system_prompt=system_prompt,
+                    system_prompt=effective_system_prompt,
                     setting_sources=setting_sources,
                     model=model,
                     base_url=base_url,
@@ -208,6 +255,7 @@ class AgentService:
         logger.info(f"  prompt: {prompt[:100]}...")
         logger.info(f"  system_prompt: {system_prompt[:200] if system_prompt else 'None'}...")
         logger.info(f"  allowed_tools: {allowed_tools}")
+        logger.info(f"  disallowed_tools: {disallowed_tools}")
         logger.info(f"  effective_api_key: {'set' if effective_api_key else 'None'}")
         logger.info(f"  effective_base_url: {effective_base_url}")
         logger.info(f"  effective_model: {effective_model}")
@@ -310,7 +358,7 @@ class AgentService:
             options.system_prompt = {
                 "type": "preset",
                 "preset": "claude_code",
-                "append": system_prompt
+                "append": system_prompt,
             }
 
         # 如果有会话ID，尝试恢复
