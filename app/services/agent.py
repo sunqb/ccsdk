@@ -265,7 +265,9 @@ class AgentService:
         # 构建选项
         # setting_sources 控制配置加载
         # - "project": {cwd}/.claude/ 配置（加载 skills）
-        # 默认只加载项目配置
+        # - 空列表: 不加载任何配置文件，仅使用 --settings 参数
+        # 注意：当同时有 --setting-sources 和 --settings 时，文件配置可能覆盖 --settings
+        # 默认使用 ["project"] 以加载 skills，但需确保 .claude/settings.json 中有 skipWebFetchPreflight
         effective_setting_sources = setting_sources if setting_sources is not None else ["project"]
 
         # 代码注入：附加 settings（permissions 等）与 MCP servers
@@ -307,6 +309,12 @@ class AgentService:
             else None
         )
 
+        # 调试日志：确认 settings 注入情况
+        logger.info(f"[Settings Injection] agent_sdk_additional_settings_json: {settings.agent_sdk_additional_settings_json}")
+        logger.info(f"[Settings Injection] injected_settings: {injected_settings}")
+        logger.info(f"[Settings Injection] injected_settings_str: {injected_settings_str}")
+        logger.info(f"[Settings Injection] setting_sources: {effective_setting_sources}")
+
         injected_mcp_servers: Any = None
         if settings.agent_sdk_mcp_servers_json:
             try:
@@ -322,6 +330,10 @@ class AgentService:
         if settings.agent_sdk_strict_mcp_config:
             extra_args["strict-mcp-config"] = None
 
+        # stderr 回调函数，用于调试 CLI 输出
+        def stderr_callback(msg: str) -> None:
+            logger.debug(f"[CLI stderr] {msg}")
+
         options = ClaudeAgentOptions(
             cwd=session.cwd or settings.work_dir,
             allowed_tools=allowed_tools,
@@ -332,12 +344,17 @@ class AgentService:
             # 权限模式：bypassPermissions 跳过交互式权限确认
             permission_mode="bypassPermissions",
             # 关键：开启 partial messages，Claude Code CLI 才会输出逐 token 的 stream_event
-            # 否则 SDK 只会在 AssistantMessage 完整生成后一次性返回 TextBlock，导致“假流式”
+            # 否则 SDK 只会在 AssistantMessage 完整生成后一次性返回 TextBlock，导致"假流式"
             include_partial_messages=True,
             settings=injected_settings_str,
             mcp_servers=injected_mcp_servers or {},
             extra_args=extra_args,
+            stderr=stderr_callback,
         )
+
+        # 打印完整的 options 用于调试
+        logger.info(f"[ClaudeAgentOptions] settings={options.settings}")
+        logger.info(f"[ClaudeAgentOptions] setting_sources={options.setting_sources}")
 
         effective_result_mode = (
             (result_mode or settings.agent_sdk_stream_result_mode or "full")
@@ -364,6 +381,11 @@ class AgentService:
         # 如果有会话ID，尝试恢复
         if session.metadata.get("resume_id"):
             options.resume = session.metadata["resume_id"]
+
+        # 最终调试日志：确认传给 query() 的 options
+        logger.info(f"[FINAL] options.settings = {options.settings}")
+        logger.info(f"[FINAL] options.setting_sources = {options.setting_sources}")
+        logger.info(f"[FINAL] options.cwd = {options.cwd}")
 
         result_text = ""
         streamed_any_text_delta = False

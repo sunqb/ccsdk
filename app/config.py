@@ -78,7 +78,10 @@ class Settings:
     # - AGENT_SDK_MCP_SERVERS_JSON：JSON 字符串，形如 {"search": {"type":"sse","url":"..."}}
     # - AGENT_SDK_STRICT_MCP_CONFIG：为 1/true 时，传递 `--strict-mcp-config`
     agent_sdk_additional_settings_json: Optional[str] = field(
-        default_factory=lambda: os.getenv("AGENT_SDK_ADDITIONAL_SETTINGS_JSON")
+        default_factory=lambda: os.getenv(
+            "AGENT_SDK_ADDITIONAL_SETTINGS_JSON",
+            '{"skipWebFetchPreflight": true}'  # 默认跳过 WebFetch 预检
+        )
     )
     agent_sdk_permissions_allow: Optional[str] = field(
         default_factory=lambda: os.getenv("AGENT_SDK_PERMISSIONS_ALLOW")
@@ -109,7 +112,7 @@ class Settings:
     # 说明：为了避免“只想要代码展示”却在服务器上落盘生成文件，默认禁用 Write/Bash。
     # 如需允许写文件，应由上层显式传入 allowed_tools/disallowed_tools 进行放开。
     default_allowed_tools: list[str] = field(
-        default_factory=lambda: ["Skill", "Read", "Glob", "Grep"]
+        default_factory=lambda: ["Skill", "Read", "Glob", "Grep", "WebSearch", "WebFetch"]
     )
 
 

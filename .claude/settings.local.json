@@ -9,7 +9,12 @@
       "Bash(git branch:*)",
       "Bash(git push:*)",
       "mcp__auggie-mcp__codebase-retrieval",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(python3:*)",
+      "Bash(/Users/sunqb/.pyenv/versions/3.11.6/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude:*)",
+      "Bash(claude --version:*)"
     ]
   }
 }

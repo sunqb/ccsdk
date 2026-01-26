@@ -349,6 +349,87 @@ effective_setting_sources = setting_sources if setting_sources is not None else 
 
 ## 常见问题
 
+### Q: WebFetch 报错 "Unable to verify if domain xxx is safe to fetch"？
+
+**重要发现**：这是因为 WebFetch 的预检（preflight）功能尝试访问 `claude.ai` 验证域名安全性，但由于网络限制导致验证失败。
+
+**解决方案**：在 `.claude/settings.json` 中添加 `skipWebFetchPreflight: true` 跳过预检：
+
+```json
+{
+  "skipWebFetchPreflight": true
+}
+```
+
+### ⚠️ 重要：Claude Code CLI 配置优先级
+
+Claude Code CLI 的配置加载机制比较复杂，理解优先级关系对于正确配置至关重要：
+
+#### 配置来源
+
+| 来源 | 说明 | CLI 参数 |
+|------|------|----------|
+| `--settings` | 通过命令行传入的 JSON 配置 | `--settings '{"key": value}'` |
+| `user` | 用户级配置 `~/.claude/settings.json` | `--setting-sources user` |
+| `project` | 项目级配置 `{cwd}/.claude/settings.json` | `--setting-sources project` |
+| `local` | 本地配置 `{cwd}/.claude/settings.local.json` | `--setting-sources local` |
+
+#### 优先级规则（从高到低）
+
+```
+1. local  (.claude/settings.local.json)     ← 最高优先级
+2. project (.claude/settings.json)
+3. user   (~/.claude/settings.json)
+4. --settings 参数                           ← 最低优先级（会被文件配置覆盖！）
+```
+
+#### 关键发现
+
+**`--settings` 参数的优先级最低！** 当同时指定了 `--setting-sources` 和 `--settings` 时：
+
+```bash
+# 这个命令中，skipWebFetchPreflight 可能不会生效！
+claude --settings '{"skipWebFetchPreflight": true}' --setting-sources project ...
+```
+
+如果 `.claude/settings.json` 中没有 `skipWebFetchPreflight` 字段，CLI 会使用默认值 `false`，**覆盖掉** `--settings` 传入的 `true`。
+
+#### 解决方案
+
+**方案 1（推荐）**：在项目的 `.claude/settings.json` 中显式配置
+
+```json
+{
+  "skipWebFetchPreflight": true,
+  "其他配置": "..."
+}
+```
+
+**方案 2**：不加载任何配置文件，仅使用 `--settings`
+
+```python
+# 将 setting_sources 设为空列表
+effective_setting_sources = []  # 不加载 user/project/local 配置
+```
+
+但方案 2 会导致 Skills 无法加载（Skills 需要 `project` 配置源）。
+
+#### 本项目的处理方式
+
+本项目通过两种方式确保 `skipWebFetchPreflight` 生效：
+
+1. **代码默认值**（`config.py`）：
+   ```python
+   agent_sdk_additional_settings_json = '{"skipWebFetchPreflight": true}'
+   ```
+
+2. **项目配置文件**（`.claude/settings.json`）：
+   ```json
+   {"skipWebFetchPreflight": true}
+   ```
+
+两者缺一不可，因为配置文件会覆盖代码传入的值。
+
 ### Q: 如何让 Claude 调用我的 Skill？
 
 确保 SKILL.md 的 `description` 字段准确描述功能，Claude 会根据用户 prompt 自动匹配。
