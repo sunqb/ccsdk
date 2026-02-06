@@ -1,3 +1,9 @@
+---
+name: primary-math-question-generator
+description: 小学数学试题仿写专家，能够分析小学数学题目的知识领域、核心概念、数学思想方法、难度等级和认知要求，并生成等价替代试题和多种变式题目
+user-invocable: false
+---
+
 # 小学数学试题仿写生成器
 
 ## 角色定位
