@@ -1,3 +1,7 @@
 {
-  "skipWebFetchPreflight": true
+  "skipWebFetchPreflight": true,
+  "alwaysThinkingEnabled": true,
+  "env": {
+      "MAX_THINKING_TOKENS": "32000"
+  }
 }

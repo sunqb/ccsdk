@@ -14,7 +14,9 @@
       "mcp__context7__query-docs",
       "Bash(python3:*)",
       "Bash(/Users/sunqb/.pyenv/versions/3.11.6/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude:*)",
-      "Bash(claude --version:*)"
+      "Bash(claude --version:*)",
+      "Bash(pip show:*)",
+      "Bash(claude:*)"
     ]
   }
 }

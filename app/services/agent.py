@@ -389,6 +389,7 @@ class AgentService:
 
         result_text = ""
         streamed_any_text_delta = False
+        streamed_any_thinking_delta = False
 
         try:
             async for message in query(prompt=prompt, options=options):
@@ -402,21 +403,42 @@ class AgentService:
                         continue
 
                     # Claude Code CLI 透传的 Anthropic Messages API stream events
-                    # 重点处理 text_delta，其余事件按需扩展
+                    # 重点处理 text_delta / thinking_delta，其余事件按需扩展
                     if raw_event.get("type") == "content_block_delta":
                         delta = raw_event.get("delta") or {}
-                        if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                streamed_any_text_delta = True
-                                if effective_result_mode == "full":
-                                    result_text += text
-                                yield AgentEvent(
-                                    type="content_block_delta",
-                                    subtype="text_delta",
-                                    data={"text": text},
-                                    conversation_id=session.id
-                                )
+                        if isinstance(delta, dict):
+                            delta_type = delta.get("type")
+                            if delta_type == "text_delta":
+                                text = delta.get("text", "")
+                                if text:
+                                    streamed_any_text_delta = True
+                                    if effective_result_mode == "full":
+                                        result_text += text
+                                    yield AgentEvent(
+                                        type="content_block_delta",
+                                        subtype="text_delta",
+                                        data={"text": text},
+                                        conversation_id=session.id
+                                    )
+                            elif delta_type == "thinking_delta":
+                                thinking = delta.get("thinking", "")
+                                if thinking:
+                                    streamed_any_thinking_delta = True
+                                    yield AgentEvent(
+                                        type="content_block_delta",
+                                        subtype="thinking_delta",
+                                        data={"thinking": thinking},
+                                        conversation_id=session.id
+                                    )
+                            elif delta_type == "signature_delta":
+                                signature = delta.get("signature", "")
+                                if signature:
+                                    yield AgentEvent(
+                                        type="content_block_delta",
+                                        subtype="signature_delta",
+                                        data={"signature": signature},
+                                        conversation_id=session.id
+                                    )
                     continue
 
                 if msg_class == "AssistantMessage":
@@ -438,6 +460,22 @@ class AgentService:
                                 data={"text": text},
                                 conversation_id=session.id
                             )
+                        elif block_type == "ThinkingBlock":
+                            # thinking 块：若已通过 StreamEvent 输出过 thinking_delta，则跳过以避免重复
+                            if streamed_any_thinking_delta:
+                                continue
+                            thinking = getattr(block, "thinking", "")
+                            signature = getattr(block, "signature", "")
+                            if thinking or signature:
+                                yield AgentEvent(
+                                    type="content_block_delta",
+                                    subtype="thinking",
+                                    data={
+                                        "thinking": thinking,
+                                        "signature": signature,
+                                    },
+                                    conversation_id=session.id
+                                )
                         elif block_type == "ToolUseBlock":
                             yield AgentEvent(
                                 type="content_block_delta",
