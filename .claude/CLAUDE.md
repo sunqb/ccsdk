@@ -12,3 +12,14 @@
 ## 输出格式规范
 - 代码输出必须完整可运行，需包含必要的 HTML 结构、JS 逻辑与最少 CSS（如有）。
 - 先给出简短说明，再给出完整代码块。
+
+## 环境变量说明
+
+Skills 运行依赖以下环境变量，需在执行环境中提前 `export`：
+
+| 变量名 | 用途 |
+|--------|------|
+| `ARK_API_KEY` | 火山引擎 ARK（Seedream / Seedance）API 密钥 |
+| `MINIMAX_API_KEY` | MiniMax TTS API 密钥 |
+| `CLAUDE_OUTPUT_DIR` | Skills 产物本地输出目录（绝对路径） |
+| `CLAUDE_OUTPUT_BASE_URL` | Skills 产物对外访问的 Base URL |
