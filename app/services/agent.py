@@ -260,6 +260,20 @@ class AgentService:
             env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = effective_model
             env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = effective_model
 
+        # 动态注入会话级 CLAUDE_OUTPUT_DIR，实现 Skill 文件输出隔离。
+        # CLAUDE_OUTPUT_DIR 配置的是基础目录，运行时追加 <conversationId>/ 子目录，
+        # 保证不同会话的 Skill 产物（图片/视频/音频）互不干扰。
+        # CLAUDE_OUTPUT_BASE_URL 不变，URL 因子路径自然携带 conversationId 前缀。
+        base_output_dir = env.get("CLAUDE_OUTPUT_DIR", "")
+        if base_output_dir and session.id:
+            session_output_dir = str(Path(base_output_dir) / session.id)
+            Path(session_output_dir).mkdir(parents=True, exist_ok=True)
+            env["CLAUDE_OUTPUT_DIR"] = session_output_dir
+            # 同步追加 session.id 到 BASE_URL，保证 Skill 拼出的展示 URL 与文件路径一致
+            base_output_url = env.get("CLAUDE_OUTPUT_BASE_URL", "")
+            if base_output_url:
+                env["CLAUDE_OUTPUT_BASE_URL"] = base_output_url.rstrip("/") + "/" + session.id
+
         # 调试日志
         logger.info("="*50)
         logger.info("Agent SDK 配置信息:")
