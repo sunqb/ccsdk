@@ -73,7 +73,7 @@ class Settings:
 
     # 通过代码注入 Claude Code CLI settings / MCP（无需写 .claude/settings.json）
     # 说明：
-    # - AGENT_SDK_ADDITIONAL_SETTINGS_JSON：JSON 字符串，将作为 `claude --settings <json>` 的“附加 settings”注入
+    # - AGENT_SDK_ADDITIONAL_SETTINGS_JSON：JSON 字符串，将作为 `claude --settings <json>` 的"附加 settings"注入
     # - AGENT_SDK_PERMISSIONS_ALLOW：逗号分隔的 allow 规则，自动合并进 additional settings 的 permissions.allow
     # - AGENT_SDK_MCP_SERVERS_JSON：JSON 字符串，形如 {"search": {"type":"sse","url":"..."}}
     # - AGENT_SDK_STRICT_MCP_CONFIG：为 1/true 时，传递 `--strict-mcp-config`
@@ -109,10 +109,47 @@ class Settings:
     )
 
     # 默认允许的工具
-    # 说明：为了避免“只想要代码展示”却在服务器上落盘生成文件，默认禁用 Write/Bash。
+    # 说明：为了避免"只想要代码展示"却在服务器上落盘生成文件，默认禁用 Write/Bash。
     # 如需允许写文件，应由上层显式传入 allowed_tools/disallowed_tools 进行放开。
     default_allowed_tools: list[str] = field(
         default_factory=lambda: ["Skill", "Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+    )
+
+    # 全局强制禁用的工具（服务端安全模式）
+    # 通过环境变量 GLOBAL_DISALLOWED_TOOLS 配置，逗号分隔，如 "Write,Bash"
+    # 设为空字符串可全部放开：GLOBAL_DISALLOWED_TOOLS=
+    global_disallowed_tools: list[str] = field(
+        default_factory=lambda: [
+            t.strip() for t in os.getenv("GLOBAL_DISALLOWED_TOOLS", "Write,Bash").split(",")
+            if t.strip()
+        ]
+    )
+
+    # Session 存储模式
+    # - memory：纯内存，重启后丢失（默认）
+    # - file：持久化到 JSON 文件，重启后自动恢复 conversationId -> resume_id 映射
+    session_store: str = field(
+        default_factory=lambda: os.getenv("SESSION_STORE", "memory").strip().lower()
+    )
+
+    # file 模式下的持久化文件路径
+    session_file_path: str = field(
+        default_factory=lambda: os.getenv("SESSION_FILE_PATH", "./.claude/sessions.json")
+    )
+
+    # db 模式下的数据库连接串（SESSION_STORE=db 时生效）
+    # 示例：mysql+asyncmy://user:pass@host:3306/dbname
+    session_db_dsn: str = field(
+        default_factory=lambda: os.getenv("SESSION_DB_DSN", "")
+    )
+
+    # 是否按 conversationId 自动隔离工作目录
+    # true：未传 cwd 时自动使用 <WORK_DIR>/sessions/<conversationId>/ 作为工作目录
+    # false（默认）：所有会话共享 WORK_DIR
+    # 前端也可以直接在请求里传 cwd 覆盖此行为
+    session_isolated_workdir: bool = field(
+        default_factory=lambda: os.getenv("SESSION_ISOLATED_WORKDIR", "").strip().lower()
+        in {"1", "true", "yes", "on"}
     )
 
 
