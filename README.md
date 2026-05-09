@@ -7,7 +7,9 @@
 - ✅ **完全兼容 cc-agent-sdk API**：实现所有核心端点
 - ✅ **Skills 自动匹配**：Claude 根据 description 自动调用 Skills
 - ✅ **SSE 流式响应**：实时推送 Agent 执行事件
-- ✅ **会话管理**：支持 `conversationId` 进行会话继续
+- ✅ **会话管理**：支持 `conversationId` 进行会话继续，重启后可恢复（file/db 模式）
+- ✅ **用户数据隔离**：每个会话独立工作目录，生成文件完全隔离
+- ✅ **文件静态访问**：配合 Nginx 将生成文件映射为 HTTP URL，前端可直接访问
 - ✅ **请求级配置覆盖**：支持 `model`、`baseURL`、`apiKey` 覆盖
 - ✅ **中文支持**：正确处理中文输出编码
 
@@ -211,7 +213,126 @@ data: {"type": "result", "subtype": "success", "data": {"result": "..."}, "conve
 - **继续会话**：后续请求复用同一个 `conversationId`
 - **查询历史**：调用 `GET /agent-sdk/history?conversationId=...`
   - Claude Code 的历史文件名是其内部 `session_id`（位于 `stream_event/init.data.session_id`，或可通过 `GET /agent-sdk/conversations` 列出）
-  - 本服务也支持用“本服务的 conversationId”查询历史（会在进程内存中映射到 `session_id`）；若服务重启，需直接使用 Claude Code 的 `session_id`
+  - 本服务也支持用”本服务的 conversationId”查询历史（会在进程内存中映射到 `session_id`）；若服务重启，需直接使用 Claude Code 的 `session_id`
+
+### 会话 ID 的两层结构
+
+本服务存在两个不同的 ID，理解它们的关系对二次开发至关重要：
+
+| ID | 来源 | 作用 |
+|----|------|------|
+| `conversationId`（如 `74dfd566-...`） | 本服务生成的 UUID | 对外暴露给调用方，用于在本服务内查找 Session |
+| `resume_id`（如 `e960de6f-...`） | Claude Code CLI 返回的 `session_id` | CLI 内部标识，对应磁盘上 `~/.claude/projects/.../<resume_id>.jsonl` |
+
+**对话历史不存在本服务**，而是由 Claude Code CLI 自动写入 `.jsonl` 文件。本服务的 Session 只是一张”索引表”，记录 `conversationId → resume_id` 的映射关系：
+
+```
+下次请求携带 conversationId=74dfd566...
+    ↓
+SessionManager 查找 Session，取出 metadata.resume_id = e960de6f...
+    ↓
+options.resume = “e960de6f...” 传给 Claude Code CLI
+    ↓
+Claude Code CLI 读取 ~/.claude/projects/.../<resume_id>.jsonl
+    ↓
+对话上下文恢复
+```
+
+**快捷方式**：如果客户端保存了 Claude Code 原始的 `resume_id`，可以直接将其作为 `conversationId` 传入，本服务会透传给 CLI，跳过映射这一层。
+
+### Session 存储模式
+
+通过 `SESSION_STORE` 环境变量选择存储后端：
+
+| 模式 | 适用场景 | 重启后恢复 | 多 Worker |
+|------|---------|-----------|-----------|
+| `memory`（默认） | 测试、无状态短会话 | ❌ | ❌ |
+| `file` | 单机长期对话 | ✅ | ❌ |
+| `db` | 生产多实例部署 | ✅ | ✅（待实现） |
+
+`file` 模式将 `conversationId → resume_id` 映射持久化到本地 JSON 文件（默认 `.claude/sessions.json`），服务重启后自动加载。`db` 模式骨架已就位，实现时填充 `app/services/session.py` 中 `DbBackend` 的 TODO 方法即可，上层代码无需修改。
+
+### 用户数据隔离与文件静态访问
+
+Skills（如古诗词视频生成）运行过程中会产生图片、视频、音频等本地文件。通过以下配置实现多用户数据隔离并让前端可直接访问这些文件。
+
+#### 工作目录隔离
+
+每个会话的生成文件落在独立目录，有两种方式：
+
+**方式 1：前端传 `cwd`（精确控制）**
+
+```json
+{
+  "prompt": "帮我生成《静夜思》的古诗词视频",
+  "conversationId": "user-123-session-abc",
+  "cwd": "/data/outputs/user-123/session-abc"
+}
+```
+
+同一 `conversationId` 后续请求不传 `cwd` 时，自动沿用第一次的值。
+
+**方式 2：自动按 `conversationId` 隔离（推荐）**
+
+```env
+SESSION_ISOLATED_WORKDIR=true
+WORK_DIR=/data/outputs
+```
+
+启用后，未传 `cwd` 的会话自动使用 `<WORK_DIR>/sessions/<conversationId>/` 作为工作目录。
+
+两种方式优先级：**请求传入的 `cwd` > `SESSION_ISOLATED_WORKDIR` 自动生成 > `WORK_DIR`**。
+
+#### Nginx 静态文件服务
+
+将 `WORK_DIR` 映射为 HTTP 路径，前端通过 URL 直接访问生成的文件：
+
+```nginx
+server {
+    listen 80;
+
+    # 静态文件访问（生成的图片、视频、音频）
+    location /outputs/ {
+        alias /data/outputs/;
+        add_header Access-Control-Allow-Origin *;
+        # 视频文件支持 Range 请求（前端播放器需要）
+        add_header Accept-Ranges bytes;
+    }
+
+    # API 反向代理
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # SSE 必须关闭缓冲
+        proxy_buffering off;
+        proxy_cache off;
+    }
+}
+```
+
+#### 文件访问 URL 规则
+
+| 配置 | 本地路径 | 访问 URL |
+|------|---------|---------|
+| `SESSION_ISOLATED_WORKDIR=true`，`WORK_DIR=/data/outputs` | `/data/outputs/sessions/<conversationId>/assets/ref.jpg` | `http://your-server/outputs/sessions/<conversationId>/assets/ref.jpg` |
+| 前端传 `cwd=/data/outputs/user-123/` | `/data/outputs/user-123/assets/ref.jpg` | `http://your-server/outputs/user-123/assets/ref.jpg` |
+
+#### Skills 文件输出约定
+
+支持输出文件的 Skills（如 `poetry-video-creator`）遵循以下目录约定：
+
+```
+$cwd/
+├── assets/          # 中间产物（参考板图片、分镜视频、旁白音频）
+│   ├── ref_*.jpg
+│   ├── scene_*.mp4
+│   └── narration_*.mp3
+└── output/          # 最终成品
+    └── final_video.mp4
+```
+
+所有路径均基于 `$PWD`（即 `cwd`）展开为绝对路径，不依赖 Node.js 进程目录。
 
 ### MCP（可选：接入搜索等外部工具）
 
@@ -261,6 +382,11 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 | `PORT` | 服务监听端口 | `8000` | 否 |
 | `WORK_DIR` | 工作目录 | 当前目录 | 否 |
 | `SKILLS_DIR` | Skills 目录 | `./.claude/skills` | 否 |
+| `GLOBAL_DISALLOWED_TOOLS` | 全局强制禁用的工具，逗号分隔；设为空字符串可全部放开 | `Write,Bash` | 否 |
+| `SESSION_STORE` | Session 存储模式：`memory` / `file` / `db` | `memory` | 否 |
+| `SESSION_FILE_PATH` | `file` 模式下的持久化文件路径 | `./.claude/sessions.json` | 否 |
+| `SESSION_DB_DSN` | `db` 模式下的数据库连接串，如 `mysql+asyncmy://user:pass@host/db` | - | 否 |
+| `SESSION_ISOLATED_WORKDIR` | 是否按 `conversationId` 自动隔离工作目录，`1/true` 启用 | `false` | 否 |
 
 ## 项目结构
 
@@ -500,20 +626,171 @@ ruff check app/
 
 ## 部署
 
+### 部署检查清单
+
+上线前逐项确认：
+
+**必填环境变量**
+- [ ] `ANTHROPIC_API_KEY` — Anthropic / 兼容 API 的密钥
+- [ ] `ANTHROPIC_BASE_URL` — 若使用代理或第三方兼容接口需填写
+- [ ] `ANTHROPIC_MODEL` — 指定模型，如 `claude-sonnet-4-6`
+- [ ] `WORK_DIR` — 生产环境建议设为独立数据目录，如 `/data/ccsdk`
+
+**Session 持久化（生产必须）**
+- [ ] `SESSION_STORE=file`（单机）或 `SESSION_STORE=db`（多实例）
+- [ ] `SESSION_FILE_PATH` — file 模式下持久化文件路径，需在 `WORK_DIR` 内
+- [ ] `SESSION_DB_DSN` — db 模式下数据库连接串（db 模式尚待实现，见 TODO）
+
+**用户数据隔离**
+- [ ] `SESSION_ISOLATED_WORKDIR=true` — 推荐生产环境开启，每个会话独立目录
+- [ ] 确认 `WORK_DIR` 目录有写权限
+
+**安全**
+- [ ] `AGENT_SDK_API_KEY` — 设置 API 认证密钥，否则接口无鉴权
+- [ ] `GLOBAL_DISALLOWED_TOOLS` — 默认 `Write,Bash`；若 Skill 需要写文件，按需调整（如改为仅 `Bash`）
+
+**Nginx（Skills 生成文件需要前端访问时必须）**
+- [ ] 配置静态文件映射（见下方 Nginx 配置）
+- [ ] 视频文件需支持 Range 请求
+
+---
+
+### 本机 / 裸机部署
+
+```bash
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 配置环境变量
+cp .env.example .env
+vim .env   # 填写必填项
+
+# 3. 启动服务（生产建议去掉 --reload）
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# 或后台运行
+nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > ccsdk.log 2>&1 &
+```
+
 ### Docker
 
 ```bash
 docker build -t ccsdk .
-docker run -d -p 8000:8000 \
+
+docker run -d \
+  --name ccsdk \
+  -p 8000:8000 \
+  -v /data/ccsdk:/data/ccsdk \
   -e ANTHROPIC_API_KEY=xxx \
+  -e ANTHROPIC_BASE_URL=https://api.anthropic.com \
+  -e ANTHROPIC_MODEL=claude-sonnet-4-6 \
+  -e WORK_DIR=/data/ccsdk \
+  -e SESSION_STORE=file \
+  -e SESSION_FILE_PATH=/data/ccsdk/.claude/sessions.json \
+  -e SESSION_ISOLATED_WORKDIR=true \
+  -e AGENT_SDK_API_KEY=your-api-key \
+  -e GLOBAL_DISALLOWED_TOOLS=Bash \
   ccsdk
 ```
 
+> `-v /data/ccsdk:/data/ccsdk` 挂载数据目录，容器重启后 session 和生成文件均不丢失。
+
 ### Docker Compose
+
+```yaml
+version: "3.8"
+services:
+  ccsdk:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - /data/ccsdk:/data/ccsdk
+    environment:
+      ANTHROPIC_API_KEY: xxx
+      ANTHROPIC_BASE_URL: https://api.anthropic.com
+      ANTHROPIC_MODEL: claude-sonnet-4-6
+      WORK_DIR: /data/ccsdk
+      SESSION_STORE: file
+      SESSION_FILE_PATH: /data/ccsdk/.claude/sessions.json
+      SESSION_ISOLATED_WORKDIR: "true"
+      AGENT_SDK_API_KEY: your-api-key
+      GLOBAL_DISALLOWED_TOOLS: Bash
+    restart: unless-stopped
+```
 
 ```bash
 docker-compose up -d
 ```
+
+### Nginx 完整配置
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    # ── 静态文件：Skills 生成的图片 / 视频 / 音频 ──────────────────
+    location /outputs/ {
+        alias /data/ccsdk/;              # 与 WORK_DIR 保持一致
+        add_header Access-Control-Allow-Origin *;
+        add_header Accept-Ranges bytes;  # 前端视频播放器需要 Range 支持
+        # 防止 .json 等配置文件被访问
+        location ~* \.(json|md|jsonl)$ {
+            return 403;
+        }
+    }
+
+    # ── API 反向代理 ────────────────────────────────────────────────
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        # SSE 流式响应必须关闭缓冲
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 600s;         # Skills 生成耗时较长，适当延长超时
+    }
+}
+```
+
+生成文件的访问 URL 格式：
+
+```
+# SESSION_ISOLATED_WORKDIR=true 时
+http://your-domain.com/outputs/sessions/<conversationId>/assets/ref_portrait.jpg
+http://your-domain.com/outputs/sessions/<conversationId>/output/final_video.mp4
+
+# 前端传 cwd=/data/ccsdk/user-123/ 时
+http://your-domain.com/outputs/user-123/assets/ref_portrait.jpg
+```
+
+---
+
+## TODO
+
+以下功能尚待实现，欢迎贡献：
+
+### 高优先级
+
+- [ ] **`db` Session 后端**：实现 `app/services/session.py` 中 `DbBackend` 的 4 个 TODO 方法（`load` / `save` / `delete` / `delete_many`），推荐使用 SQLAlchemy async + MySQL/PostgreSQL，适合多 Worker 生产部署
+- [ ] **生成文件清理**：`SESSION_ISOLATED_WORKDIR=true` 时，会话过期后自动清理对应目录，避免磁盘无限增长；建议与 `cleanup_expired` 联动
+
+### 中优先级
+
+- [ ] **文件 URL 自动注入**：Claude 回复里的本地文件路径自动转换为可访问的 HTTP URL，无需前端手动拼接；需在 SSE 事件流里做路径替换
+- [ ] **多 Worker 支持**：当前 `memory` / `file` 模式均不支持多进程共享，生产多 Worker 场景需先完成 `db` 后端
+- [ ] **会话列表 API**：`GET /agent-sdk/sessions` 返回当前所有活跃会话及对应工作目录，便于运维排查
+
+### 低优先级
+
+- [ ] **Docker 镜像优化**：当前无 Dockerfile，补充多阶段构建镜像
+- [ ] **Skills 热重载**：当前 Skills 在服务启动时加载，修改后需重启；支持 `POST /skills/reload` 热重载
+- [ ] **`db` 后端迁移脚本**：提供建表 SQL 和迁移脚本，降低 `db` 模式接入成本
+
+---
 
 ## 许可证
 
