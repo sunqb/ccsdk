@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ..config import settings
 from .session import session_manager, Session
+from .history import history_service
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -41,8 +42,8 @@ class AgentEvent:
 
 PROJECT_CLAUDE_MD_RELATIVE_PATH = ".claude/CLAUDE.md"
 
-# 全局强制禁用写入/执行类工具（服务端安全模式）
-GLOBAL_DISALLOWED_TOOLS = ["Write", "Bash"]
+# 全局强制禁用写入/执行类工具（服务端安全模式），从配置读取，支持环境变量覆盖
+GLOBAL_DISALLOWED_TOOLS = settings.global_disallowed_tools
 
 
 def _load_project_claude_md(cwd: str | None) -> str:
@@ -121,10 +122,20 @@ class AgentService:
         """
         await self._ensure_initialized()
 
+        # 确定有效工作目录（优先级：请求传入 > 会话已有 > 按 conversationId 自动隔离）
+        # SESSION_ISOLATED_WORKDIR=true 时，未传 cwd 的会话自动使用 <WORK_DIR>/sessions/<conversationId>/
+        effective_cwd = cwd
+        if not effective_cwd and settings.session_isolated_workdir and conversation_id:
+            effective_cwd = str(Path(settings.work_dir) / "sessions" / conversation_id)
+
+        # 自动创建工作目录（前端传入或自动隔离路径均可能不存在）
+        final_cwd = effective_cwd or settings.work_dir
+        Path(final_cwd).mkdir(parents=True, exist_ok=True)
+
         # 获取或创建会话
         session = await session_manager.get_or_create_session(
             session_id=conversation_id,
-            cwd=cwd or settings.work_dir
+            cwd=final_cwd
         )
 
         # 构建工具配置
@@ -330,9 +341,12 @@ class AgentService:
         if settings.agent_sdk_strict_mcp_config:
             extra_args["strict-mcp-config"] = None
 
-        # stderr 回调函数，用于调试 CLI 输出
+        # 收集 CLI stderr，用于错误诊断
+        stderr_lines: list[str] = []
+
         def stderr_callback(msg: str) -> None:
-            logger.debug(f"[CLI stderr] {msg}")
+            logger.error(f"[CLI stderr] {msg}")
+            stderr_lines.append(msg)
 
         options = ClaudeAgentOptions(
             cwd=session.cwd or settings.work_dir,
@@ -378,9 +392,13 @@ class AgentService:
                 "append": system_prompt,
             }
 
-        # 如果有会话ID，尝试恢复
+        # 如果有会话ID，先修复可能损坏的 .jsonl，再恢复
         if session.metadata.get("resume_id"):
-            options.resume = session.metadata["resume_id"]
+            resume_id = session.metadata["resume_id"]
+            result = history_service.repair_session(resume_id)
+            if result["repaired"]:
+                logger.warning(f"[resume] 修复损坏历史 resume_id={resume_id}, patched={result['patched_count']}")
+            options.resume = resume_id
 
         # 最终调试日志：确认传给 query() 的 options
         logger.info(f"[FINAL] options.settings = {options.settings}")
@@ -494,9 +512,11 @@ class AgentService:
                         result = getattr(message, "result", "")
                         session_id = getattr(message, "session_id", None)
 
-                        # 保存 session_id 用于后续恢复
+                        # 保存 session_id 用于后续恢复（file 模式下同步写盘）
                         if session_id:
-                            session.metadata["resume_id"] = session_id
+                            await session_manager.update_session_metadata(
+                                session.id, {"resume_id": session_id}
+                            )
 
                         if effective_result_mode == "none":
                             yield AgentEvent(
@@ -548,11 +568,32 @@ class AgentService:
                     )
 
         except Exception as e:
-            yield AgentEvent(
-                type="error",
-                data={"message": str(e)},
-                conversation_id=session.id
-            )
+            error_detail = str(e)
+            if stderr_lines:
+                error_detail += "\n[CLI stderr]\n" + "\n".join(stderr_lines)
+            logger.error(f"[_query_with_sdk] error: {error_detail}")
+
+            # 历史会话损坏（工具调用中断导致 tool_calls 无对应 tool_result）时，
+            # 清除 resume_id 让下次请求以新 session 启动，conversationId 保持不变。
+            # 历史 .jsonl 文件仍保留在磁盘，本次对话上下文丢失但 conversationId 可继续使用。
+            if "tool_call_ids did not have response messages" in error_detail and session.metadata.get("resume_id"):
+                old_resume_id = session.metadata["resume_id"]
+                await session_manager.update_session_metadata(session.id, {"resume_id": None})
+                logger.warning(f"[_query_with_sdk] 历史会话损坏，已清除 resume_id={old_resume_id}，下次请求将以新 session 继续")
+                yield AgentEvent(
+                    type="error",
+                    data={
+                        "message": "历史会话因上次中断损坏，已自动重置。请重新发送消息，对话可继续（历史上下文已丢失）。",
+                        "code": "corrupted_session_reset",
+                    },
+                    conversation_id=session.id
+                )
+            else:
+                yield AgentEvent(
+                    type="error",
+                    data={"message": error_detail},
+                    conversation_id=session.id
+                )
 
     async def query(
         self,
