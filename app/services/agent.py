@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import tempfile
+import uuid
 from typing import Optional, Any, AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ from pathlib import Path
 from ..config import settings
 from .session import session_manager, Session
 from .history import history_service
+from .virtual_space import virtual_space_manager
+from .docker_sandbox import docker_sandbox_runner
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -122,21 +125,38 @@ class AgentService:
         """
         await self._ensure_initialized()
 
-        # 确定有效工作目录（优先级：请求传入 > 会话已有 > 按 conversationId 自动隔离）
-        # SESSION_ISOLATED_WORKDIR=true 时，未传 cwd 的会话自动使用 <WORK_DIR>/sessions/<conversationId>/
-        effective_cwd = cwd
-        if not effective_cwd and settings.session_isolated_workdir and conversation_id:
-            effective_cwd = str(Path(settings.work_dir) / "sessions" / conversation_id)
+        session_id = conversation_id or str(uuid.uuid4())
+        virtual_space = None
 
-        # 自动创建工作目录（前端传入或自动隔离路径均可能不存在）
-        final_cwd = effective_cwd or settings.work_dir
-        Path(final_cwd).mkdir(parents=True, exist_ok=True)
+        if docker_sandbox_runner.enabled or virtual_space_manager.enabled:
+            virtual_space = virtual_space_manager.prepare(session_id)
+            final_cwd = str(virtual_space.root)
+        else:
+            # 确定有效工作目录（优先级：请求传入 > 会话已有 > 按 conversationId 自动隔离）
+            # SESSION_ISOLATED_WORKDIR=true 时，未传 cwd 的会话自动使用 <WORK_DIR>/sessions/<conversationId>/
+            effective_cwd = cwd
+            if not effective_cwd and settings.session_isolated_workdir and session_id:
+                effective_cwd = str(Path(settings.work_dir) / "sessions" / session_id)
 
-        # 获取或创建会话
+            # 自动创建工作目录（前端传入或自动隔离路径均可能不存在）
+            final_cwd = effective_cwd or settings.work_dir
+            Path(final_cwd).mkdir(parents=True, exist_ok=True)
+
+        # 获取或创建会话。虚拟化模式下 cwd 是用户独立 Claude project 根目录。
         session = await session_manager.get_or_create_session(
-            session_id=conversation_id,
+            session_id=session_id,
             cwd=final_cwd
         )
+        if virtual_space:
+            await session_manager.update_session_metadata(
+                session.id,
+                {
+                    "virtual_space_id": virtual_space.id,
+                    "virtual_space_root": str(virtual_space.root),
+                    "virtual_space_workspace": str(virtual_space.workspace),
+                    "virtual_space_skills_dir": str(virtual_space.skills_dir),
+                },
+            )
 
         # 构建工具配置
         # None 表示使用 SDK 默认工具集（完整工具）
@@ -156,6 +176,53 @@ class AgentService:
         effective_system_prompt = _merge_system_prompts(system_prompt, project_claude_md)
 
         try:
+            if docker_sandbox_runner.enabled:
+                sandbox_env = {
+                    "ANTHROPIC_API_KEY": api_key or settings.anthropic_api_key,
+                    "ANTHROPIC_AUTH_TOKEN": api_key or settings.anthropic_auth_token,
+                    "ANTHROPIC_BASE_URL": base_url or settings.anthropic_base_url,
+                    "ANTHROPIC_MODEL": model or settings.anthropic_model,
+                    "CLAUDE_OUTPUT_DIR": "/sandbox/workspace",
+                    "CLAUDE_OUTPUT_BASE_URL": os.getenv("CLAUDE_OUTPUT_BASE_URL", ""),
+                    "AGENT_SDK_ADDITIONAL_SETTINGS_JSON": settings.agent_sdk_additional_settings_json,
+                    "AGENT_SDK_PERMISSIONS_ALLOW": settings.agent_sdk_permissions_allow,
+                    "AGENT_SDK_MCP_SERVERS_JSON": settings.agent_sdk_mcp_servers_json,
+                    "AGENT_SDK_STRICT_MCP_CONFIG": str(settings.agent_sdk_strict_mcp_config).lower(),
+                }
+                sandbox_request = {
+                    "session_id": session.id,
+                    "prompt": prompt,
+                    "cwd": "/sandbox",
+                    "workspace": "/sandbox/workspace",
+                    "allowed_tools": tools,
+                    "disallowed_tools": effective_disallowed_tools,
+                    "max_turns": max_turns,
+                    "system_prompt": effective_system_prompt,
+                    "setting_sources": setting_sources,
+                    "model": model,
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "result_mode": result_mode,
+                    "metadata": session.metadata,
+                    "env": sandbox_env,
+                }
+                async for raw_event in docker_sandbox_runner.run(
+                    session_id=session.id,
+                    sandbox_root=virtual_space.root,
+                    request=sandbox_request,
+                ):
+                    if raw_event.get("type") == "__sandbox_metadata":
+                        metadata = raw_event.get("data") or {}
+                        await session_manager.update_session_metadata(session.id, metadata)
+                        continue
+                    yield AgentEvent(
+                        type=raw_event.get("type", "stream_event"),
+                        subtype=raw_event.get("subtype"),
+                        data=raw_event.get("data"),
+                        conversation_id=raw_event.get("conversationId") or session.id,
+                    )
+                return
+
             # 尝试导入 claude_agent_sdk
             try:
                 from claude_agent_sdk import query, ClaudeAgentOptions
@@ -261,11 +328,28 @@ class AgentService:
             env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = effective_model
 
         # 动态注入会话级 CLAUDE_OUTPUT_DIR，实现 Skill 文件输出隔离。
-        # CLAUDE_OUTPUT_DIR 配置的是基础目录，运行时追加 <conversationId>/ 子目录，
-        # 保证不同会话的 Skill 产物（图片/视频/音频）互不干扰。
-        # CLAUDE_OUTPUT_BASE_URL 不变，URL 因子路径自然携带 conversationId 前缀。
+        # 虚拟化模式下产物固定落在虚拟空间 workspace/，避免写入复制出的应用/skills。
+        virtual_workspace = session.metadata.get("virtual_space_workspace")
         base_output_dir = env.get("CLAUDE_OUTPUT_DIR", "")
-        if base_output_dir and session.id:
+        if virtual_workspace:
+            session_output_dir = str(Path(virtual_workspace))
+            Path(session_output_dir).mkdir(parents=True, exist_ok=True)
+            env["CLAUDE_OUTPUT_DIR"] = session_output_dir
+
+            base_output_url = env.get("CLAUDE_OUTPUT_BASE_URL", "")
+            url_base_dir = Path(base_output_dir or settings.work_dir).expanduser()
+            try:
+                relative_output = Path(session_output_dir).resolve().relative_to(url_base_dir.resolve())
+                if base_output_url:
+                    env["CLAUDE_OUTPUT_BASE_URL"] = (
+                        base_output_url.rstrip("/") + "/" + relative_output.as_posix()
+                    )
+            except ValueError:
+                if base_output_url:
+                    logger.warning(
+                        "CLAUDE_OUTPUT_DIR is outside URL base; keep CLAUDE_OUTPUT_BASE_URL unchanged"
+                    )
+        elif base_output_dir and session.id:
             session_output_dir = str(Path(base_output_dir) / session.id)
             Path(session_output_dir).mkdir(parents=True, exist_ok=True)
             env["CLAUDE_OUTPUT_DIR"] = session_output_dir
@@ -528,6 +612,7 @@ class AgentService:
 
                         # 保存 session_id 用于后续恢复（file 模式下同步写盘）
                         if session_id:
+                            session.metadata["resume_id"] = session_id
                             await session_manager.update_session_metadata(
                                 session.id, {"resume_id": session_id}
                             )

@@ -152,5 +152,79 @@ class Settings:
         in {"1", "true", "yes", "on"}
     )
 
+    # 沙箱文件系统模板。Docker 沙箱会把该目录挂载为容器内 /sandbox。
+    # true：不启用 Docker 时也可以仅使用目录级 project 隔离。
+    virtual_space_enabled: bool = field(
+        default_factory=lambda: os.getenv("VIRTUAL_SPACE_ENABLED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    # 虚拟空间根目录，默认 <WORK_DIR>/virtual_spaces
+    virtual_space_dir: str = field(
+        default_factory=lambda: os.getenv("VIRTUAL_SPACE_DIR", "")
+    )
+    # 被复制的应用程序源目录，默认项目根目录
+    virtual_space_source_dir: str = field(
+        default_factory=lambda: os.getenv("VIRTUAL_SPACE_SOURCE_DIR", "")
+    )
+    # 需要复制进虚拟空间根目录的应用文件/目录，逗号分隔
+    virtual_space_app_paths: list[str] = field(
+        default_factory=lambda: [
+            item.strip()
+            for item in os.getenv(
+                "VIRTUAL_SPACE_APP_PATHS",
+                "app,pyproject.toml,requirements.txt,README.md",
+            ).split(",")
+            if item.strip()
+        ]
+    )
+    # 需要从源项目 .claude/ 复制到虚拟空间 .claude/ 的文件，逗号分隔
+    virtual_space_claude_files: list[str] = field(
+        default_factory=lambda: [
+            item.strip()
+            for item in os.getenv("VIRTUAL_SPACE_CLAUDE_FILES", "CLAUDE.md,settings.json").split(",")
+            if item.strip()
+        ]
+    )
+
+    # Docker 真实沙箱。开启后 Claude Agent SDK/CLI 在受限容器内运行。
+    sandbox_enabled: bool = field(
+        default_factory=lambda: os.getenv("SANDBOX_ENABLED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    sandbox_runtime: str = field(
+        default_factory=lambda: os.getenv("SANDBOX_RUNTIME", "docker")
+    )
+    sandbox_image: str = field(
+        default_factory=lambda: os.getenv("SANDBOX_IMAGE", "ccsdk-sandbox:latest")
+    )
+    sandbox_network: str = field(
+        default_factory=lambda: os.getenv("SANDBOX_NETWORK", "bridge")
+    )
+    sandbox_memory: str = field(
+        default_factory=lambda: os.getenv("SANDBOX_MEMORY", "2g")
+    )
+    sandbox_cpus: str = field(
+        default_factory=lambda: os.getenv("SANDBOX_CPUS", "1.0")
+    )
+    sandbox_pids_limit: int = field(
+        default_factory=lambda: int(os.getenv("SANDBOX_PIDS_LIMIT", "256"))
+    )
+    sandbox_tmpfs_size: str = field(
+        default_factory=lambda: os.getenv("SANDBOX_TMPFS_SIZE", "256m")
+    )
+    sandbox_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "900"))
+    )
+    sandbox_read_only_rootfs: bool = field(
+        default_factory=lambda: os.getenv("SANDBOX_READ_ONLY_ROOTFS", "true").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    sandbox_uid: int = field(
+        default_factory=lambda: int((os.getenv("SANDBOX_UID") or str(os.getuid() or 1000)).strip())
+    )
+    sandbox_gid: int = field(
+        default_factory=lambda: int((os.getenv("SANDBOX_GID") or str(os.getgid() or 1000)).strip())
+    )
+
 
 settings = Settings()

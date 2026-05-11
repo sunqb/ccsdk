@@ -283,6 +283,217 @@ WORK_DIR=/data/outputs
 
 两种方式优先级：**请求传入的 `cwd` > `SESSION_ISOLATED_WORKDIR` 自动生成 > `WORK_DIR`**。
 
+#### Docker 真实沙箱（系统级隔离）
+
+如果不希望不同用户只通过目录隔离，可以开启 Docker 沙箱。开启后，宿主 API 服务只负责鉴权、会话、沙箱文件系统准备和 SSE 转发，Claude Agent SDK 与 Claude Code CLI 都在一次性 Docker 容器内执行。
+
+##### 设计目标
+
+- **真实执行隔离**：模型工具调用、Claude Code CLI、Skill 脚本都在 Docker 容器内运行，不在宿主 API 进程内运行。
+- **最小宿主挂载**：每个 `conversationId` 只挂载自己的 `/sandbox`，容器看不到其他用户空间。
+- **可写范围收敛**：容器根文件系统只读，业务产物只能写入 `/sandbox/workspace`，CLI 配置/缓存只能写入容器 tmpfs。
+- **资源可控**：通过 Docker 限制 CPU、内存、进程数和超时。
+- **保持现有 API**：前端仍调用 `/agent-sdk/stream`，SSE 事件格式不变。
+
+##### 架构组件
+
+| 组件 | 位置 | 职责 |
+|------|------|------|
+| API 服务 | 宿主或主服务容器 | 接收请求、管理 session、准备沙箱目录、启动 Docker 沙箱、转发 SSE |
+| `VirtualSpaceManager` | `app/services/virtual_space.py` | 为每个 `conversationId` 创建独立文件系统模板，复制应用程序与 skills |
+| `DockerSandboxRunner` | `app/services/docker_sandbox.py` | 拼装并执行 `docker run`，读取容器 stdout JSON 事件 |
+| `sandbox_worker` | `app/sandbox_worker.py` | 容器内入口，调用 Claude Agent SDK 并逐行输出 AgentEvent JSON |
+| 沙箱镜像 | `ccsdk-sandbox:latest` | 内置 Python 依赖、应用代码和 `claude-agent-sdk` |
+
+##### 请求执行流程
+
+1. 前端请求 `/agent-sdk/stream`，传入 `prompt` 和 `conversationId`。
+2. API 服务计算会话 ID；没有传 `conversationId` 时自动生成 UUID。
+3. API 服务在 `<WORK_DIR>/virtual_spaces/<safe-conversationId>/` 准备沙箱文件系统。
+4. `DockerSandboxRunner` 启动一次性容器，并把该目录挂载为容器内 `/sandbox`。
+5. 容器内 `sandbox_worker` 以 `/sandbox` 作为 Claude project 根目录执行 Agent SDK。
+6. Agent SDK 加载 `/sandbox/.claude/skills`，产物写入 `/sandbox/workspace`。
+7. 容器逐行输出 JSON 事件，宿主服务转换为原 SSE 事件流返回前端。
+8. 请求完成后容器自动删除，`workspace` 产物保留在宿主 `WORK_DIR` 下。
+
+##### 沙箱文件系统
+
+宿主侧每个 `conversationId` 对应一个目录：
+
+```text
+<WORK_DIR>/virtual_spaces/<safe-conversationId>/
+├── app/                 # 从 VIRTUAL_SPACE_SOURCE_DIR 复制的应用代码
+├── pyproject.toml       # 可选复制的应用文件
+├── requirements.txt
+├── README.md
+├── .claude/
+│   ├── CLAUDE.md        # 可选复制
+│   ├── settings.json    # 可选复制
+│   └── skills/          # 从 SKILLS_DIR 复制
+└── workspace/           # 当前用户/会话的产物输出目录
+```
+
+容器内固定路径：
+
+```text
+/sandbox                 # 当前 conversationId 的独立 project 根目录
+/sandbox/.claude/skills  # 当前用户空间内的 skills
+/sandbox/workspace       # 产物输出目录
+/home/sandbox            # tmpfs，Claude CLI 的 HOME/XDG/CLAUDE_CONFIG_DIR
+/tmp                     # tmpfs
+```
+
+##### 隔离边界
+
+默认 `docker run` 安全参数：
+
+```bash
+docker run --rm -i \
+  --read-only \
+  --user <SANDBOX_UID>:<SANDBOX_GID> \
+  --network <SANDBOX_NETWORK> \
+  --memory <SANDBOX_MEMORY> \
+  --cpus <SANDBOX_CPUS> \
+  --pids-limit <SANDBOX_PIDS_LIMIT> \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=<SANDBOX_TMPFS_SIZE> \
+  --tmpfs /home/sandbox:rw,nosuid,nodev,size=<SANDBOX_TMPFS_SIZE>,uid=<SANDBOX_UID>,gid=<SANDBOX_GID>,mode=700 \
+  -v <sandbox-root>:/sandbox:rw \
+  -w /app \
+  ccsdk-sandbox:latest python -m app.sandbox_worker
+```
+
+说明：
+
+- 容器根文件系统只读，防止修改镜像内应用和依赖。
+- 容器内非 root 运行，满足 Claude CLI 对 bypass 权限模式的要求。
+- Linux capabilities 全部移除，并禁止 `no-new-privileges` 提权。
+- `/tmp` 使用 `noexec` tmpfs；`/home/sandbox` 使用私有 tmpfs，保存 CLI 临时配置和缓存。
+- 唯一业务挂载是当前会话的 `/sandbox`，其他会话目录不会进入容器。
+- `SANDBOX_NETWORK=bridge` 时容器可访问外网/API；若完全禁止联网可改为 `none`，但模型 API 调用也会不可用。
+
+##### 配置项
+
+最小启用配置：
+
+```env
+SANDBOX_ENABLED=true
+SANDBOX_IMAGE=ccsdk-sandbox:latest
+WORK_DIR=/data/outputs
+SKILLS_DIR=./.claude/skills
+```
+
+完整沙箱配置：
+
+```env
+# 开启 Docker 沙箱
+SANDBOX_ENABLED=true
+SANDBOX_RUNTIME=docker
+SANDBOX_IMAGE=ccsdk-sandbox:latest
+
+# 模型请求需要联网时使用 bridge；离线沙箱可设为 none
+SANDBOX_NETWORK=bridge
+
+# 资源限制
+SANDBOX_MEMORY=2g
+SANDBOX_CPUS=1.0
+SANDBOX_PIDS_LIMIT=256
+SANDBOX_TMPFS_SIZE=256m
+SANDBOX_TIMEOUT_SECONDS=900
+SANDBOX_READ_ONLY_ROOTFS=true
+
+# 留空时自动使用 API 服务进程 UID/GID；容器内必须非 root
+SANDBOX_UID=
+SANDBOX_GID=
+```
+
+沙箱文件系统模板配置：
+
+```env
+# 默认 <WORK_DIR>/virtual_spaces，必须是 Docker daemon 可 bind mount 的宿主路径
+VIRTUAL_SPACE_DIR=/data/outputs/virtual_spaces
+
+# 默认当前服务项目根目录
+VIRTUAL_SPACE_SOURCE_DIR=/opt/ccsdk
+
+# 复制到沙箱根目录的应用文件/目录
+VIRTUAL_SPACE_APP_PATHS=app,pyproject.toml,requirements.txt,README.md
+
+# 从源项目 .claude/ 复制到沙箱 .claude/ 的文件
+VIRTUAL_SPACE_CLAUDE_FILES=CLAUDE.md,settings.json
+```
+
+##### 部署步骤
+
+1. 构建沙箱镜像：
+
+```bash
+docker build -t ccsdk-sandbox:latest .
+```
+
+2. 确认 `WORK_DIR` 可被 Docker daemon bind mount：
+
+```bash
+mkdir -p /data/outputs
+docker run --rm -v /data/outputs:/sandbox:rw ccsdk-sandbox:latest sh -c 'touch /sandbox/.write-test && rm /sandbox/.write-test'
+```
+
+3. 配置 `.env`：
+
+```env
+ANTHROPIC_API_KEY=xxx
+ANTHROPIC_BASE_URL=https://api.anthropic.com
+ANTHROPIC_MODEL=claude-sonnet-4-20250514
+WORK_DIR=/data/outputs
+SKILLS_DIR=./.claude/skills
+SANDBOX_ENABLED=true
+SANDBOX_IMAGE=ccsdk-sandbox:latest
+SESSION_STORE=file
+SESSION_FILE_PATH=/data/outputs/.claude/sessions.json
+```
+
+4. 启动 API 服务：
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+5. 发送最小验证请求：
+
+```bash
+curl -N http://127.0.0.1:8000/agent-sdk/stream \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: your-api-key' \
+  -d '{
+    "conversationId": "sandbox-smoke-test",
+    "prompt": "请只回复 pong",
+    "options": {
+      "allowedTools": [],
+      "disallowedTools": ["Write", "Bash"],
+      "maxTurns": 1
+    }
+  }'
+```
+
+预期返回包含：
+
+```text
+"subtype":"init"
+"subtype":"text_delta"
+"result":"pong"
+```
+
+##### 部署注意事项
+
+- `WORK_DIR` 和 `VIRTUAL_SPACE_DIR` 必须是 Docker daemon 可访问、可写、可 bind mount 的宿主路径。
+- macOS/Colima/Docker Desktop 需要确认文件共享目录；例如某些环境默认不共享外置盘 `/Volumes/...`。
+- API 服务如果运行在 Docker 内，需要挂载 `/var/run/docker.sock` 才能启动沙箱容器。
+- 挂载 Docker socket 等价于让 API 服务具备启动容器的高权限，只能给可信服务使用。
+- 生产建议把 `GLOBAL_DISALLOWED_TOOLS` 至少保留 `Bash`，除非确实需要 Skill 执行命令。
+- `SANDBOX_UID`/`SANDBOX_GID` 必须能写入 `<sandbox-root>`；留空时使用 API 服务进程 UID/GID。
+- 修改应用代码、依赖或 `sandbox_worker` 后，需要重新构建 `SANDBOX_IMAGE`。
+
 #### Nginx 静态文件服务
 
 将 `WORK_DIR` 映射为 HTTP 路径，前端通过 URL 直接访问生成的文件：
@@ -315,6 +526,7 @@ server {
 
 | 配置 | 本地路径 | 访问 URL |
 |------|---------|---------|
+| `SANDBOX_ENABLED=true`，`WORK_DIR=/data/outputs` | `/data/outputs/virtual_spaces/<safe-conversationId>/workspace/output/final_video.mp4` | `http://your-server/outputs/virtual_spaces/<safe-conversationId>/workspace/output/final_video.mp4` |
 | `SESSION_ISOLATED_WORKDIR=true`，`WORK_DIR=/data/outputs` | `/data/outputs/sessions/<conversationId>/assets/ref.jpg` | `http://your-server/outputs/sessions/<conversationId>/assets/ref.jpg` |
 | 前端传 `cwd=/data/outputs/user-123/` | `/data/outputs/user-123/assets/ref.jpg` | `http://your-server/outputs/user-123/assets/ref.jpg` |
 
@@ -642,12 +854,16 @@ ruff check app/
 - [ ] `SESSION_DB_DSN` — db 模式下数据库连接串（db 模式尚待实现，见 TODO）
 
 **用户数据隔离**
-- [ ] `SESSION_ISOLATED_WORKDIR=true` — 推荐生产环境开启，每个会话独立目录
+- [ ] `SANDBOX_ENABLED=true` — 推荐生产环境开启，Claude CLI 在 Docker 沙箱内执行
 - [ ] 确认 `WORK_DIR` 目录有写权限
+- [ ] 确认 Docker daemon 可以 bind mount `WORK_DIR`（容器内能读写）
+- [ ] 已构建 `SANDBOX_IMAGE`，服务进程可以执行 `docker run`
+- [ ] `SANDBOX_UID` / `SANDBOX_GID` 能写入 `WORK_DIR`；留空时使用服务进程 UID/GID
 
 **安全**
 - [ ] `AGENT_SDK_API_KEY` — 设置 API 认证密钥，否则接口无鉴权
 - [ ] `GLOBAL_DISALLOWED_TOOLS` — 默认 `Write,Bash`；若 Skill 需要写文件，按需调整（如改为仅 `Bash`）
+- [ ] 若 API 服务运行在 Docker 内，仅可信服务可挂载 `/var/run/docker.sock`
 
 **Nginx（Skills 生成文件需要前端访问时必须）**
 - [ ] 配置静态文件映射（见下方 Nginx 配置）
@@ -661,11 +877,19 @@ ruff check app/
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 配置环境变量
+# 2. 构建沙箱镜像
+docker build -t ccsdk-sandbox:latest .
+
+# 3. 验证 WORK_DIR 可被 Docker 挂载并写入
+mkdir -p /data/ccsdk
+docker run --rm -v /data/ccsdk:/sandbox:rw ccsdk-sandbox:latest \
+  sh -c 'touch /sandbox/.write-test && rm /sandbox/.write-test'
+
+# 4. 配置环境变量
 cp .env.example .env
 vim .env   # 填写必填项
 
-# 3. 启动服务（生产建议去掉 --reload）
+# 5. 启动服务（生产建议去掉 --reload）
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # 或后台运行
@@ -675,25 +899,29 @@ nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > ccsdk.log 2>&1 &
 ### Docker
 
 ```bash
+docker build -t ccsdk-sandbox:latest .
 docker build -t ccsdk .
 
 docker run -d \
   --name ccsdk \
   -p 8000:8000 \
   -v /data/ccsdk:/data/ccsdk \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -e ANTHROPIC_API_KEY=xxx \
   -e ANTHROPIC_BASE_URL=https://api.anthropic.com \
   -e ANTHROPIC_MODEL=claude-sonnet-4-6 \
   -e WORK_DIR=/data/ccsdk \
   -e SESSION_STORE=file \
   -e SESSION_FILE_PATH=/data/ccsdk/.claude/sessions.json \
-  -e SESSION_ISOLATED_WORKDIR=true \
+  -e SANDBOX_ENABLED=true \
+  -e SANDBOX_IMAGE=ccsdk-sandbox:latest \
   -e AGENT_SDK_API_KEY=your-api-key \
   -e GLOBAL_DISALLOWED_TOOLS=Bash \
   ccsdk
 ```
 
-> `-v /data/ccsdk:/data/ccsdk` 挂载数据目录，容器重启后 session 和生成文件均不丢失。
+> `-v /var/run/docker.sock:/var/run/docker.sock` 允许 API 服务启动沙箱容器；生产环境建议只让可信服务进程访问 Docker socket。
+> 如果 Docker daemon 与 API 服务不在同一台机器或不共享同一文件系统，`WORK_DIR` 必须改成 Docker daemon 可见的路径。
 
 ### Docker Compose
 
@@ -702,10 +930,12 @@ version: "3.8"
 services:
   ccsdk:
     build: .
+    image: ccsdk-sandbox:latest
     ports:
       - "8000:8000"
     volumes:
       - /data/ccsdk:/data/ccsdk
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       ANTHROPIC_API_KEY: xxx
       ANTHROPIC_BASE_URL: https://api.anthropic.com
@@ -713,15 +943,19 @@ services:
       WORK_DIR: /data/ccsdk
       SESSION_STORE: file
       SESSION_FILE_PATH: /data/ccsdk/.claude/sessions.json
-      SESSION_ISOLATED_WORKDIR: "true"
+      SANDBOX_ENABLED: "true"
+      SANDBOX_IMAGE: ccsdk-sandbox:latest
       AGENT_SDK_API_KEY: your-api-key
       GLOBAL_DISALLOWED_TOOLS: Bash
     restart: unless-stopped
 ```
 
 ```bash
+docker-compose build
 docker-compose up -d
 ```
+
+`image: ccsdk-sandbox:latest` 会把 API 服务镜像同时作为沙箱镜像使用；如果你希望 API 服务和沙箱镜像分开管理，可以保留 `SANDBOX_IMAGE` 指向单独构建的镜像。
 
 ### Nginx 完整配置
 

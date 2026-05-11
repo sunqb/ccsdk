@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用代码
 COPY app/ ./app/
-COPY skills/ ./skills/
+RUN chmod -R a+rX /app
 
 # 创建工作目录
 RUN mkdir -p /workspace
