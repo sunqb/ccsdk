@@ -2,6 +2,7 @@
 配置管理模块
 """
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
@@ -18,16 +19,16 @@ def _secret_status(value: str | None) -> str:
         return "None"
     return f"set(len={len(value)})"
 
-print("="*50)
-print(f"[Config] 加载 .env 文件: {env_path}")
-print(f"[Config] .env 文件存在: {env_path.exists()}")
-print(f"[Config] load_dotenv 返回: {loaded}")
-print(f"[Config] ANTHROPIC_API_KEY: {_secret_status(os.getenv('ANTHROPIC_API_KEY'))}")
-print(f"[Config] ANTHROPIC_AUTH_TOKEN: {_secret_status(os.getenv('ANTHROPIC_AUTH_TOKEN'))}")
-print(f"[Config] ANTHROPIC_BASE_URL: {os.getenv('ANTHROPIC_BASE_URL', 'None')}")
-print(f"[Config] ANTHROPIC_MODEL: {os.getenv('ANTHROPIC_MODEL', 'None')}")
-print(f"[Config] WORK_DIR: {os.getenv('WORK_DIR', 'None')}")
-print("="*50)
+print("="*50, file=sys.stderr)
+print(f"[Config] 加载 .env 文件: {env_path}", file=sys.stderr)
+print(f"[Config] .env 文件存在: {env_path.exists()}", file=sys.stderr)
+print(f"[Config] load_dotenv 返回: {loaded}", file=sys.stderr)
+print(f"[Config] ANTHROPIC_API_KEY: {_secret_status(os.getenv('ANTHROPIC_API_KEY'))}", file=sys.stderr)
+print(f"[Config] ANTHROPIC_AUTH_TOKEN: {_secret_status(os.getenv('ANTHROPIC_AUTH_TOKEN'))}", file=sys.stderr)
+print(f"[Config] ANTHROPIC_BASE_URL: {os.getenv('ANTHROPIC_BASE_URL', 'None')}", file=sys.stderr)
+print(f"[Config] ANTHROPIC_MODEL: {os.getenv('ANTHROPIC_MODEL', 'None')}", file=sys.stderr)
+print(f"[Config] WORK_DIR: {os.getenv('WORK_DIR', 'None')}", file=sys.stderr)
+print("="*50, file=sys.stderr)
 
 
 @dataclass
@@ -224,6 +225,15 @@ class Settings:
     )
     sandbox_gid: int = field(
         default_factory=lambda: int((os.getenv("SANDBOX_GID") or str(os.getgid() or 1000)).strip())
+    )
+    # 允许从 API 服务环境透传进一次性沙箱容器的业务环境变量名，逗号分隔。
+    # 不默认透传全部环境，避免把宿主/API 容器敏感信息暴露给 skill 执行环境。
+    sandbox_env_passthrough: list[str] = field(
+        default_factory=lambda: [
+            item.strip()
+            for item in os.getenv("SANDBOX_ENV_PASSTHROUGH", "").split(",")
+            if item.strip()
+        ]
     )
 
 

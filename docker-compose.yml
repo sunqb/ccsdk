@@ -1,27 +1,49 @@
 services:
   cc-agent-sdk:
     build: .
+    image: ${SANDBOX_IMAGE:-ccsdk-sandbox:latest}
     container_name: cc-agent-sdk
+    env_file:
+      - .env
     ports:
-      - "8000:8000"
+      - "${AGENT_SDK_PORT:-8000}:8000"
     environment:
-      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}
       - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+      - AGENT_SDK_API_KEY=${AGENT_SDK_API_KEY:-}
       - AGENT_SDK_FIRST_OUTPUT_TIMEOUT_MS=${AGENT_SDK_FIRST_OUTPUT_TIMEOUT_MS:-30000}
       - AGENT_SDK_PERMISSIONS_ALLOW=${AGENT_SDK_PERMISSIONS_ALLOW:-}
-      - WORK_DIR=/workspace
-      - SKILLS_DIR=/app/skills
+      - AGENT_SDK_ADDITIONAL_SETTINGS_JSON=${AGENT_SDK_ADDITIONAL_SETTINGS_JSON:-}
+      - AGENT_SDK_MCP_SERVERS_JSON=${AGENT_SDK_MCP_SERVERS_JSON:-}
+      - AGENT_SDK_STRICT_MCP_CONFIG=${AGENT_SDK_STRICT_MCP_CONFIG:-false}
+      - GLOBAL_DISALLOWED_TOOLS=${GLOBAL_DISALLOWED_TOOLS:-Write,Bash}
+      - WORK_DIR=${WORK_DIR:-/tmp/ccsdk-workspace}
+      - SKILLS_DIR=/app/.claude/skills
+      - SESSION_STORE=${SESSION_STORE:-file}
+      - SESSION_FILE_PATH=${SESSION_FILE_PATH:-${WORK_DIR:-/tmp/ccsdk-workspace}/.claude/sessions.json}
+      - SESSION_ISOLATED_WORKDIR=${SESSION_ISOLATED_WORKDIR:-false}
       - SANDBOX_ENABLED=${SANDBOX_ENABLED:-false}
+      - SANDBOX_RUNTIME=${SANDBOX_RUNTIME:-docker}
       - SANDBOX_IMAGE=${SANDBOX_IMAGE:-ccsdk-sandbox:latest}
       - SANDBOX_NETWORK=${SANDBOX_NETWORK:-bridge}
       - SANDBOX_MEMORY=${SANDBOX_MEMORY:-2g}
       - SANDBOX_CPUS=${SANDBOX_CPUS:-1.0}
       - SANDBOX_PIDS_LIMIT=${SANDBOX_PIDS_LIMIT:-256}
+      - SANDBOX_TMPFS_SIZE=${SANDBOX_TMPFS_SIZE:-256m}
       - SANDBOX_TIMEOUT_SECONDS=${SANDBOX_TIMEOUT_SECONDS:-900}
+      - SANDBOX_READ_ONLY_ROOTFS=${SANDBOX_READ_ONLY_ROOTFS:-true}
+      - SANDBOX_UID=${SANDBOX_UID:-1000}
+      - SANDBOX_GID=${SANDBOX_GID:-1000}
+      - SANDBOX_ENV_PASSTHROUGH=${SANDBOX_ENV_PASSTHROUGH:-}
+      - VIRTUAL_SPACE_ENABLED=${VIRTUAL_SPACE_ENABLED:-false}
+      - VIRTUAL_SPACE_DIR=${VIRTUAL_SPACE_DIR:-${WORK_DIR:-/tmp/ccsdk-workspace}/virtual_spaces}
+      - VIRTUAL_SPACE_SOURCE_DIR=/app
+      - VIRTUAL_SPACE_APP_PATHS=${VIRTUAL_SPACE_APP_PATHS:-app,pyproject.toml,requirements.txt,README.md}
+      - VIRTUAL_SPACE_CLAUDE_FILES=${VIRTUAL_SPACE_CLAUDE_FILES:-CLAUDE.md,settings.json}
     volumes:
-      - ./workspace:/workspace
-      - ./.claude/skills:/app/skills:ro
+      - ${WORK_DIR:-/tmp/ccsdk-workspace}:${WORK_DIR:-/tmp/ccsdk-workspace}
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
     healthcheck:

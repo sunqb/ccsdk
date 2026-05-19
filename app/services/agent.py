@@ -93,6 +93,7 @@ class AgentService:
         self,
         prompt: str,
         conversation_id: Optional[str] = None,
+        space_id: Optional[str] = None,
         allowed_tools: Optional[list[str]] = None,
         disallowed_tools: Optional[list[str]] = None,
         max_turns: Optional[int] = None,
@@ -110,6 +111,7 @@ class AgentService:
         Args:
             prompt: 用户提示词
             conversation_id: 会话ID（用于继续对话）
+            space_id: 虚拟化/沙箱数据空间ID，优先于 conversation_id
             allowed_tools: 允许的工具列表
             disallowed_tools: 禁止的工具列表
             max_turns: 最大对话轮数
@@ -126,10 +128,11 @@ class AgentService:
         await self._ensure_initialized()
 
         session_id = conversation_id or str(uuid.uuid4())
+        virtual_space_id = space_id or conversation_id or session_id
         virtual_space = None
 
         if docker_sandbox_runner.enabled or virtual_space_manager.enabled:
-            virtual_space = virtual_space_manager.prepare(session_id)
+            virtual_space = virtual_space_manager.prepare(virtual_space_id, session_id=session_id)
             final_cwd = str(virtual_space.root)
         else:
             # 确定有效工作目录（优先级：请求传入 > 会话已有 > 按 conversationId 自动隔离）
@@ -152,9 +155,12 @@ class AgentService:
                 session.id,
                 {
                     "virtual_space_id": virtual_space.id,
+                    "virtual_space_session_id": virtual_space.session_id,
+                    "virtual_space_key": virtual_space_id,
                     "virtual_space_root": str(virtual_space.root),
                     "virtual_space_workspace": str(virtual_space.workspace),
                     "virtual_space_skills_dir": str(virtual_space.skills_dir),
+                    "virtual_space_home": str(virtual_space.home_dir),
                 },
             )
 
@@ -177,18 +183,39 @@ class AgentService:
 
         try:
             if docker_sandbox_runner.enabled:
+                sandbox_output_base_url = os.getenv("CLAUDE_OUTPUT_BASE_URL", "")
+                if sandbox_output_base_url and virtual_space:
+                    output_base_dir = Path(os.getenv("CLAUDE_OUTPUT_DIR") or settings.work_dir).expanduser()
+                    try:
+                        relative_workspace = virtual_space.workspace.resolve().relative_to(
+                            output_base_dir.resolve()
+                        )
+                        sandbox_output_base_url = (
+                            sandbox_output_base_url.rstrip("/")
+                            + "/"
+                            + relative_workspace.as_posix()
+                        )
+                    except ValueError:
+                        logger.warning(
+                            "virtual space workspace is outside CLAUDE_OUTPUT_DIR/settings.work_dir; "
+                            "keep CLAUDE_OUTPUT_BASE_URL unchanged"
+                        )
                 sandbox_env = {
                     "ANTHROPIC_API_KEY": api_key or settings.anthropic_api_key,
                     "ANTHROPIC_AUTH_TOKEN": api_key or settings.anthropic_auth_token,
                     "ANTHROPIC_BASE_URL": base_url or settings.anthropic_base_url,
                     "ANTHROPIC_MODEL": model or settings.anthropic_model,
                     "CLAUDE_OUTPUT_DIR": "/sandbox/workspace",
-                    "CLAUDE_OUTPUT_BASE_URL": os.getenv("CLAUDE_OUTPUT_BASE_URL", ""),
+                    "CLAUDE_OUTPUT_BASE_URL": sandbox_output_base_url,
                     "AGENT_SDK_ADDITIONAL_SETTINGS_JSON": settings.agent_sdk_additional_settings_json,
                     "AGENT_SDK_PERMISSIONS_ALLOW": settings.agent_sdk_permissions_allow,
                     "AGENT_SDK_MCP_SERVERS_JSON": settings.agent_sdk_mcp_servers_json,
                     "AGENT_SDK_STRICT_MCP_CONFIG": str(settings.agent_sdk_strict_mcp_config).lower(),
                 }
+                for env_name in settings.sandbox_env_passthrough:
+                    value = os.getenv(env_name)
+                    if value is not None:
+                        sandbox_env[env_name] = value
                 sandbox_request = {
                     "session_id": session.id,
                     "prompt": prompt,
@@ -209,6 +236,7 @@ class AgentService:
                 async for raw_event in docker_sandbox_runner.run(
                     session_id=session.id,
                     sandbox_root=virtual_space.root,
+                    sandbox_home=virtual_space.home_dir,
                     request=sandbox_request,
                 ):
                     if raw_event.get("type") == "__sandbox_metadata":
@@ -265,7 +293,7 @@ class AgentService:
         self,
         prompt: str,
         session: Session,
-        allowed_tools: list[str],
+        allowed_tools: Optional[list[str]],
         disallowed_tools: Optional[list[str]],
         max_turns: Optional[int],
         system_prompt: Optional[str] = None,
@@ -341,9 +369,12 @@ class AgentService:
             try:
                 relative_output = Path(session_output_dir).resolve().relative_to(url_base_dir.resolve())
                 if base_output_url:
-                    env["CLAUDE_OUTPUT_BASE_URL"] = (
-                        base_output_url.rstrip("/") + "/" + relative_output.as_posix()
-                    )
+                    if relative_output.as_posix() == ".":
+                        env["CLAUDE_OUTPUT_BASE_URL"] = base_output_url.rstrip("/")
+                    else:
+                        env["CLAUDE_OUTPUT_BASE_URL"] = (
+                            base_output_url.rstrip("/") + "/" + relative_output.as_posix()
+                        )
             except ValueError:
                 if base_output_url:
                     logger.warning(
@@ -370,6 +401,9 @@ class AgentService:
         logger.info(f"  effective_model: {effective_model}")
         logger.info(f"  work_dir: {settings.work_dir}")
         logger.info("="*50)
+
+        effective_allowed_tools = allowed_tools or []
+        effective_disallowed_tools = disallowed_tools or []
 
         # 构建选项
         # setting_sources 控制配置加载
@@ -448,8 +482,8 @@ class AgentService:
 
         options = ClaudeAgentOptions(
             cwd=session.cwd or settings.work_dir,
-            allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools or [],
+            allowed_tools=effective_allowed_tools,
+            disallowed_tools=effective_disallowed_tools,
             setting_sources=effective_setting_sources,
             env=env,
             model=effective_model,
@@ -494,9 +528,17 @@ class AgentService:
         if session.metadata.get("resume_id"):
             resume_id = session.metadata["resume_id"]
             result = history_service.repair_session(resume_id)
-            if result["repaired"]:
-                logger.warning(f"[resume] 修复损坏历史 resume_id={resume_id}, patched={result['patched_count']}")
-            options.resume = resume_id
+            if result.get("error") == "file not found":
+                session.metadata["resume_id"] = None
+                await session_manager.update_session_metadata(session.id, {"resume_id": None})
+                logger.warning(
+                    "[resume] 找不到 Claude 历史文件，已清除失效 resume_id=%s，本次请求将创建新 Claude session",
+                    resume_id,
+                )
+            else:
+                if result["repaired"]:
+                    logger.warning(f"[resume] 修复损坏历史 resume_id={resume_id}, patched={result['patched_count']}")
+                options.resume = resume_id
 
         # 最终调试日志：确认传给 query() 的 options
         logger.info(f"[FINAL] options.settings = {options.settings}")
@@ -698,6 +740,7 @@ class AgentService:
         self,
         prompt: str,
         conversation_id: Optional[str] = None,
+        space_id: Optional[str] = None,
         allowed_tools: Optional[list[str]] = None,
         disallowed_tools: Optional[list[str]] = None,
         max_turns: Optional[int] = None,
@@ -718,6 +761,7 @@ class AgentService:
         async for event in self.query_stream(
             prompt=prompt,
             conversation_id=conversation_id,
+            space_id=space_id,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
             max_turns=max_turns,

@@ -3,6 +3,7 @@
 """
 import hashlib
 import logging
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -26,12 +27,14 @@ _IGNORE_NAMES = {
 
 @dataclass(frozen=True)
 class VirtualSpace:
-    """单个会话的虚拟化空间路径。"""
+    """单个用户空间及其中一个会话的虚拟化路径。"""
 
     id: str
+    session_id: str
     root: Path
     workspace: Path
     skills_dir: Path
+    home_dir: Path
 
 
 def _project_root() -> Path:
@@ -82,6 +85,32 @@ def _copy_path(source: Path, dest: Path) -> None:
     shutil.copy2(source, dest)
 
 
+def _apply_sandbox_owner(root: Path) -> None:
+    if not _as_bool(settings.sandbox_enabled):
+        return
+
+    uid = settings.sandbox_uid
+    gid = settings.sandbox_gid
+
+    try:
+        for current_root, dirs, files in os.walk(root):
+            current_path = Path(current_root)
+            os.chown(current_path, uid, gid)
+            current_path.chmod(0o755)
+            for name in dirs:
+                path = current_path / name
+                os.chown(path, uid, gid)
+                path.chmod(0o755)
+            for name in files:
+                path = current_path / name
+                os.chown(path, uid, gid)
+                path.chmod(0o644)
+        workspace = root / "workspace"
+        workspace.chmod(0o775)
+    except PermissionError as exc:
+        logger.warning("[VirtualSpace] cannot chown virtual space %s: %s", root, exc)
+
+
 class VirtualSpaceManager:
     """为每个会话准备独立 Claude project。"""
 
@@ -89,7 +118,7 @@ class VirtualSpaceManager:
     def enabled(self) -> bool:
         return _as_bool(settings.virtual_space_enabled)
 
-    def prepare(self, session_id: str) -> VirtualSpace:
+    def prepare(self, space_id: str, session_id: str | None = None) -> VirtualSpace:
         source_root = (
             Path(settings.virtual_space_source_dir or _project_root())
             .expanduser()
@@ -99,15 +128,21 @@ class VirtualSpaceManager:
         base_dir = base_dir.expanduser().resolve()
         base_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_id = _safe_id(session_id)
+        safe_id = _safe_id(space_id)
+        safe_session_id = _safe_id(session_id or space_id)
         root = (base_dir / safe_id).resolve()
         if not root.is_relative_to(base_dir):
             raise ValueError("Invalid virtual space path")
 
         workspace = root / "workspace"
+        sessions_dir = root / "sessions"
+        home_dir = sessions_dir / safe_session_id / ".home"
         claude_dir = root / ".claude"
         skills_dir = claude_dir / "skills"
         workspace.mkdir(parents=True, exist_ok=True)
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        home_dir.mkdir(parents=True, exist_ok=True)
+        (home_dir / ".claude").mkdir(parents=True, exist_ok=True)
         claude_dir.mkdir(parents=True, exist_ok=True)
         skills_dir.mkdir(parents=True, exist_ok=True)
 
@@ -132,11 +167,15 @@ class VirtualSpaceManager:
             if source.exists() and source.is_file():
                 _copy_path(source, claude_dir / name)
 
+        _apply_sandbox_owner(root)
+
         return VirtualSpace(
             id=safe_id,
+            session_id=safe_session_id,
             root=root,
             workspace=workspace,
             skills_dir=skills_dir,
+            home_dir=home_dir,
         )
 
 

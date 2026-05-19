@@ -6,6 +6,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
+    docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制依赖文件
@@ -16,6 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用代码
 COPY app/ ./app/
+COPY pyproject.toml README.md ./
+COPY .claude/skills/ ./.claude/skills/
+COPY .claude/CLAUDE.md .claude/settings.json ./.claude/
 RUN chmod -R a+rX /app
 
 # 创建工作目录
@@ -25,7 +29,7 @@ RUN mkdir -p /workspace
 ENV HOST=0.0.0.0
 ENV PORT=8000
 ENV WORK_DIR=/workspace
-ENV SKILLS_DIR=/app/skills
+ENV SKILLS_DIR=/app/.claude/skills
 
 # 暴露端口
 EXPOSE 8000

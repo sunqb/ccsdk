@@ -59,6 +59,11 @@ class StreamRequest(BaseModel):
         alias="conversationId",
         description="会话ID，映射到 cc 的 resume；不传则创建新会话"
     )
+    space_id: Optional[str] = Field(
+        None,
+        alias="spaceId",
+        description="虚拟化/沙箱数据空间ID；优先于 conversationId，用于登录用户文件空间隔离"
+    )
 
     # API 配置覆盖（请求级别）
     model: Optional[str] = Field(
@@ -141,6 +146,11 @@ class QueryRequest(BaseModel):
         None,
         alias="conversationId",
         description="会话ID，用于继续之前的对话"
+    )
+    space_id: Optional[str] = Field(
+        None,
+        alias="spaceId",
+        description="虚拟化/沙箱数据空间ID；优先于 conversationId，用于登录用户文件空间隔离"
     )
     allowed_tools: Optional[list[str]] = Field(
         None,

@@ -15,6 +15,7 @@ router = APIRouter(prefix="/agent", tags=["Agent"])
 async def _generate_sse_events(
     prompt: str,
     conversation_id: str | None,
+    space_id: str | None,
     allowed_tools: list[str] | None,
     disallowed_tools: list[str] | None,
     max_turns: int | None,
@@ -24,6 +25,7 @@ async def _generate_sse_events(
     async for event in agent_service.query_stream(
         prompt=prompt,
         conversation_id=conversation_id,
+        space_id=space_id,
         allowed_tools=allowed_tools,
         disallowed_tools=disallowed_tools,
         max_turns=max_turns,
@@ -39,6 +41,7 @@ async def query_agent(request: QueryRequest) -> QueryResponse:
 
     - **prompt**: 用户输入的提示词
     - **conversationId**: 可选，会话ID用于继续之前的对话
+    - **spaceId**: 可选，虚拟化/沙箱数据空间ID
     - **allowedTools**: 可选，允许使用的工具列表
     - **disallowedTools**: 可选，禁止使用的工具列表
     - **maxTurns**: 可选，最大对话轮数
@@ -47,6 +50,7 @@ async def query_agent(request: QueryRequest) -> QueryResponse:
     result = await agent_service.query(
         prompt=request.prompt,
         conversation_id=request.conversation_id,
+        space_id=request.space_id,
         allowed_tools=request.allowed_tools,
         disallowed_tools=request.disallowed_tools,
         max_turns=request.max_turns,
@@ -76,6 +80,7 @@ async def query_agent_stream(request: QueryRequest):
         _generate_sse_events(
             prompt=request.prompt,
             conversation_id=request.conversation_id,
+            space_id=request.space_id,
             allowed_tools=request.allowed_tools,
             disallowed_tools=request.disallowed_tools,
             max_turns=request.max_turns,

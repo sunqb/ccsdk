@@ -18,6 +18,7 @@ router = APIRouter(prefix="/agent-sdk", tags=["Agent SDK"])
 async def _generate_sse_stream(
     prompt: str,
     conversation_id: Optional[str],
+    space_id: Optional[str],
     allowed_tools: Optional[list[str]],
     disallowed_tools: Optional[list[str]],
     max_turns: Optional[int],
@@ -42,6 +43,7 @@ async def _generate_sse_stream(
     async for event in agent_service.query_stream(
         prompt=prompt,
         conversation_id=conversation_id,
+        space_id=space_id,
         allowed_tools=tools,
         disallowed_tools=disallowed_tools,
         max_turns=max_turns,
@@ -81,6 +83,7 @@ async def agent_sdk_stream(request: StreamRequest):
     **请求参数:**
     - prompt/userMessage: 用户消息（二选一）
     - conversationId: 会话ID，映射到 cc 的 resume；不传则创建新会话
+    - spaceId: 虚拟化/沙箱数据空间ID；优先于 conversationId，用于登录用户文件空间隔离
     - model: 可选，覆盖默认模型
     - baseURL: 可选，覆盖默认 API URL
     - apiKey: 可选，覆盖默认 API Key
@@ -130,6 +133,7 @@ async def agent_sdk_stream(request: StreamRequest):
         _generate_sse_stream(
             prompt=prompt,
             conversation_id=request.conversation_id,
+            space_id=request.space_id,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
             max_turns=max_turns,
