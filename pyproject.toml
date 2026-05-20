@@ -15,19 +15,23 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "pydantic>=2.0.0",
     "claude-agent-sdk>=0.1.0",
+    "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
-    "httpx>=0.27.0",
     "ruff>=0.6.0",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+url = "http://mirrors.aliyun.com/pypi/simple/"
+default = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
@@ -43,3 +47,7 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: tests that require optional external services or real SDK setup",
+    "rag_smoke: opt-in RAG Agent smoke tests gated by RUN_RAG_AGENT_SMOKE=1",
+]

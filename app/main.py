@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .routers import agent_router, skills_router
+from .routers import agent_router, rag_router, skills_router
 from .routers.agent_sdk import router as agent_sdk_router
 from .services.skills import skills_manager
 from .models.response import HealthResponse
@@ -54,6 +54,7 @@ app.add_middleware(
 # 注册路由
 app.include_router(agent_sdk_router)  # 兼容原 cc-agent-sdk API
 app.include_router(agent_router)       # 简化版 API
+app.include_router(rag_router)         # RAG API
 app.include_router(skills_router)      # Skills API
 
 

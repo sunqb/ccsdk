@@ -624,6 +624,10 @@ black app/
 ruff check app/
 ```
 
+### RAG + Agent 后续 TODO
+
+- [ ] 为 `/rag/agent/stream` 增加前端传入 Skills 限制方案：请求可携带允许使用的 skill 名称列表，例如 `allowedSkills: ["translate", "text-optimize"]`，服务端将其转换为 Claude Agent SDK 可执行范围，确保回答阶段只允许使用前端显式传入的 Skills。第一版 `/rag/agent/stream` 先保持 Claude Agent SDK 原生 Skills 感知能力，不额外限制具体 Skills。
+
 ## 部署
 
 ### 部署检查清单
