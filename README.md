@@ -1,6 +1,6 @@
 # CC Agent SDK
 
-基于 Claude Agent SDK (Python) 的 Agent 服务，完全遵循 [cc-agent-sdk](https://github.com/Auto-200/cc-agent-sdk) 设计理念。
+基于 Claude Agent SDK (Python) 的 Agent 服务，完全遵循 [cc-agent-sdk](https://github.com/Auto-200/cc-agent-sdk) 设计理念。在兼容原有 Agent / Skills 能力的基础上，内置 **RAG 知识库问答**（文档上传、混合检索、Claude SDK + in-process MCP 编排）。
 
 ## 特性
 
@@ -74,49 +74,88 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ### 5. 测试 API
 
+**Agent 流式（需配置 `AGENT_SDK_API_KEY` 时加 `-H "X-API-Key: ..."`）**
+
 ```bash
 curl -X POST http://localhost:8000/agent-sdk/stream \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello, Claude!"}'
+  -d '{"prompt": "Hello, Claude!", "options": {"allowedTools": []}}'
+```
+
+**RAG（需 `RAG_ENABLED=true`）**
+
+```bash
+# 1. 上传文档
+curl -X POST http://localhost:8000/rag/files \
+  -F "file=@./docs/specs/rag-document-parsing.md"
+
+# 2. 基于 fileSetId 流式问答（推荐入口）
+curl -N -X POST http://localhost:8000/agent-sdk/rag/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message": "这份文档讲了什么？", "fileSetId": "<上一步返回的 fileSetId>"}'
 ```
 
 ## 核心架构
 
-### 完全遵循 cc-agent-sdk 设计
+### 整体架构
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   Client                        │
-└─────────────────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│              FastAPI Application                │
-│                                                 │
-│  /agent-sdk/stream    - 统一调用入口            │
-│  /agent-sdk/history   - 历史记录                │
-│  /agent-sdk/projects  - 项目列表                │
-│  /agent-sdk/conversations - 会话列表            │
-│                                                 │
-│  /skills              - Skills 管理 (查询/创建)  │
-│                                                 │
-└─────────────────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│           Claude Agent SDK (Python)             │
-│                                                 │
-│  • settingSources: ["project"]                  │
-│  • 从 .claude/skills/ 加载 Skills               │
-│  • Claude 根据 description 自动匹配             │
-│                                                 │
-└─────────────────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│            Anthropic Claude API                 │
-└─────────────────────────────────────────────────┘
+                         ┌──────────────┐
+                         │    Client    │
+                         └──────┬───────┘
+                                │ HTTP / SSE
+                                ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                     FastAPI (app/main.py)                         │
+│  ┌─────────────┐ ┌─────────────┐ ┌──────────┐ ┌────────────────┐ │
+│  │ agent_sdk   │ │    rag      │ │  skills  │ │ agent (简化)   │ │
+│  │ /agent-sdk/*│ │   /rag/*    │ │ /skills/*│ │   /agent/*     │ │
+│  └──────┬──────┘ └──────┬──────┘ └────┬─────┘ └───────┬────────┘ │
+│         │               │             │               │          │
+│         ▼               ▼             ▼               ▼          │
+│  services/agent   services/rag   services/skills   (同上)       │
+│  services/session services/history                               │
+└───────────────────────────────┬───────────────────────────────────┘
+                                │
+          ┌─────────────────────┴─────────────────────┐
+          ▼                                           ▼
+┌─────────────────────────┐              ┌────────────────────────────┐
+│ Claude Agent SDK (CLI)  │              │ RAG Pipeline（可选启用）    │
+│ • Skills 自动匹配        │              │ 解析 → 切分 → Embedding    │
+│ • MCP（项目 + 注入）     │◄─ mcp_servers│ → Local SQLite 向量检索   │
+│ • 会话 resume / 历史     │              │ → Hybrid Search / Rerank   │
+└───────────┬─────────────┘              └────────────────────────────┘
+            ▼
+┌─────────────────────────┐
+│ Anthropic / 兼容 API    │
+└─────────────────────────┘
 ```
+
+### RAG 数据流
+
+```
+上传 POST /rag/files
+    → DocumentParser (local / mineru)
+    → TextChunker → EmbeddingProvider → LocalVectorStore (rag.db)
+    → 返回 fileSetId
+
+问答 POST /agent-sdk/rag/stream  （推荐）
+    → RagAgentRunner.stream_claude_sdk
+    → 注入 request-scoped MCP: rag_hybrid_search / rag_read_chunk / ...
+    → Claude 自主决定是否检索 → 流式 SSE 回答
+
+纯 RAG 调试 POST /rag/stream
+    → 同上，但 allowed_tools 仅限四个 RAG MCP 工具（无 Skills 编排）
+```
+
+### 路由分组
+
+| 前缀 | 模块 | 说明 |
+|------|------|------|
+| `/agent-sdk` | `routers/agent_sdk.py` | cc-agent-sdk 兼容入口；含 `/rag/stream` |
+| `/rag` | `routers/rag.py` | 文档上传、知识库、RAG 流式/非流式、运维 |
+| `/skills` | `routers/skills.py` | Skills CRUD |
+| `/agent` | `routers/agent.py` | 简化版非兼容 API（`/query`、`/query/stream`） |
 
 ## Skills 使用方式
 
@@ -172,16 +211,37 @@ curl -X POST http://localhost:8000/agent-sdk/stream \
 
 ## API 端点
 
-### 核心端点
+> 配置了 `AGENT_SDK_API_KEY` 时，受保护接口需请求头 `X-API-Key: <key>`（与 cc-agent-sdk 一致）。
+
+### Agent SDK（cc-agent-sdk 兼容）
 
 | 方法 | 端点 | 描述 |
 |------|------|------|
-| POST | `/agent-sdk/stream` | 流式查询 (SSE) |
+| POST | `/agent-sdk/stream` | Agent 流式查询 (SSE) |
+| POST | `/agent-sdk/rag/stream` | **RAG + Skills 流式问答（推荐）** |
 | GET | `/agent-sdk/history` | 查询会话历史 |
-| GET | `/agent-sdk/projects` | 列出所有项目 |
-| GET | `/agent-sdk/conversations` | 列出所有会话 |
+| GET | `/agent-sdk/projects` | 列出 Claude Code 项目 |
+| GET | `/agent-sdk/conversations` | 列出会话 |
 
-### Skills 管理端点
+### RAG
+
+| 方法 | 端点 | 描述 |
+|------|------|------|
+| POST | `/rag/files` | 上传文档，解析索引，返回 `fileSetId` |
+| GET | `/rag/files/{file_set_id}/status` | 查询 fileSet 索引进度 |
+| POST | `/rag/knowledge-bases` | 创建持久化知识库 |
+| GET | `/rag/knowledge-bases` | 列出知识库 |
+| DELETE | `/rag/knowledge-bases/{id}` | 删除知识库 |
+| POST | `/agent-sdk/rag/stream` | RAG + Agent + Skills（**生产推荐**） |
+| POST | `/rag/agent/stream` | 同上，Legacy / 诊断入口 |
+| POST | `/rag/stream` | 纯 RAG MCP 流式（无 Skills） |
+| POST | `/rag/query` | 非流式问答（服务端预检索） |
+| GET | `/rag/admin/provider-info` | 当前 RAG provider 配置摘要 |
+| GET | `/rag/admin/stats` | 存储与索引统计 |
+| POST | `/rag/admin/evaluate` | 检索评测 |
+| POST | `/rag/admin/cleanup` | 清理过期临时 fileSet |
+
+### Skills 管理
 
 | 方法 | 端点 | 描述 |
 |------|------|------|
@@ -191,7 +251,14 @@ curl -X POST http://localhost:8000/agent-sdk/stream \
 | POST | `/skills` | 创建新 Skill |
 | DELETE | `/skills/{name}` | 删除 Skill |
 
-**注意**：没有 `/skills/{name}/invoke` 端点，因为 Skills 通过 `/agent-sdk/stream` 自动调用。
+### 简化 Agent API
+
+| 方法 | 端点 | 描述 |
+|------|------|------|
+| POST | `/agent/query` | 非流式查询 |
+| POST | `/agent/query/stream` | 流式查询 |
+
+**注意**：没有 `/skills/{name}/invoke` 端点；Skills 通过 `/agent-sdk/stream` 或 `/agent-sdk/rag/stream` 由 Claude 自动匹配调用。
 
 ### POST /agent-sdk/stream
 
@@ -385,72 +452,98 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 
 ## 环境变量
 
+完整示例见 [`.env.example`](.env.example)。下表列出常用项：
+
+### Agent / 服务
+
 | 变量名 | 描述 | 默认值 | 必填 |
 |--------|------|--------|------|
 | `ANTHROPIC_API_KEY` | Anthropic API Key | - | ✅ |
 | `ANTHROPIC_AUTH_TOKEN` | 同 API_KEY | - | 否 |
 | `ANTHROPIC_BASE_URL` | API Base URL | - | 否 |
-| `ANTHROPIC_MODEL` | 使用的模型 | `claude-sonnet-4-5-20250929` | 否 |
-| `AGENT_SDK_API_KEY` | API 认证密钥 | - | 否 |
-| `AGENT_SDK_STREAM_RESULT_MODE` | `/agent-sdk/stream` 的 result(success) 输出模式：`full|empty|none` | `full` | 否 |
-| `AGENT_SDK_STREAM_EVENT_MODE` | `/agent-sdk/stream` 的事件输出模式：`full|text_only` | `full` | 否 |
-| `AGENT_SDK_ADDITIONAL_SETTINGS_JSON` | 通过代码注入 `claude --settings <json>` 的附加 settings（JSON 字符串） | - | 否 |
-| `AGENT_SDK_PERMISSIONS_ALLOW` | 逗号分隔的 `permissions.allow` 规则（会合并进 additional settings） | - | 否 |
-| `AGENT_SDK_MCP_SERVERS_JSON` | 通过代码注入 MCP servers（JSON 字符串，形如 `{\"search\": {\"type\":\"sse\",\"url\":\"...\"}}`） | - | 否 |
-| `AGENT_SDK_STRICT_MCP_CONFIG` | 仅使用注入的 MCP（传 `--strict-mcp-config`），`1/true` 启用 | - | 否 |
-| `HOST` | 服务监听地址 | `0.0.0.0` | 否 |
-| `PORT` | 服务监听端口 | `8000` | 否 |
-| `WORK_DIR` | 工作目录 | 当前目录 | 否 |
+| `ANTHROPIC_MODEL` | 使用的模型 | `claude-sonnet-4-20250514` | 否 |
+| `AGENT_SDK_API_KEY` | 服务 API 认证密钥 | - | 否 |
+| `AGENT_SDK_STREAM_RESULT_MODE` | result 输出：`full` / `empty` / `none` | `full` | 否 |
+| `AGENT_SDK_STREAM_EVENT_MODE` | 事件输出：`full` / `text_only` | `full` | 否 |
+| `AGENT_SDK_ADDITIONAL_SETTINGS_JSON` | 注入 `claude --settings` 的 JSON | `{"skipWebFetchPreflight":true}` | 否 |
+| `AGENT_SDK_PERMISSIONS_ALLOW` | `permissions.allow` 规则（逗号分隔） | - | 否 |
+| `AGENT_SDK_MCP_SERVERS_JSON` | 注入外部 MCP servers（JSON） | - | 否 |
+| `HOST` / `PORT` | 监听地址与端口 | `0.0.0.0` / `8000` | 否 |
+| `WORK_DIR` | Agent 工作目录 | 项目根目录 | 否 |
 | `SKILLS_DIR` | Skills 目录 | `./.claude/skills` | 否 |
-| `GLOBAL_DISALLOWED_TOOLS` | 全局强制禁用的工具，逗号分隔；设为空字符串可全部放开 | `Write,Bash` | 否 |
-| `SESSION_STORE` | Session 存储模式：`memory` / `file` / `db` | `memory` | 否 |
-| `SESSION_FILE_PATH` | `file` 模式下的持久化文件路径 | `./.claude/sessions.json` | 否 |
-| `SESSION_DB_DSN` | `db` 模式下的数据库连接串，如 `mysql+asyncmy://user:pass@host/db` | - | 否 |
-| `SESSION_ISOLATED_WORKDIR` | 是否按 `conversationId` 自动隔离工作目录，`1/true` 启用 | `false` | 否 |
-| `RAG_ENABLED` | 是否启用 RAG 功能 | `false` | 否 |
-| `RAG_STORAGE_DIR` | RAG 本地状态存储目录 | `${WORK_DIR}/rag` | 否 |
-| `RAG_PARSER_PROVIDER` | RAG 文档解析 provider：`local` / `mineru` | `local` | 否 |
-| `MINERU_BASE_URL` | MinerU 服务地址，`RAG_PARSER_PROVIDER=mineru` 时使用 | - | 否 |
-| `MINERU_API_KEY` | MinerU Bearer Token，为空则不发送认证头 | - | 否 |
-| `MINERU_TIMEOUT_SECONDS` | 单文件 MinerU 解析超时，单位秒 | `120` | 否 |
-| `MINERU_FALLBACK_TO_LOCAL` | MinerU 失败时是否回退本地 PDF/DOCX 解析，`1/true` 启用 | `false` | 否 |
-| `RAG_ALLOWED_EXTENSIONS` | RAG 上传允许扩展名 | `.txt,.md,.pdf,.docx` | 否 |
-| `RAG_MAX_UPLOAD_FILES` | 单次 RAG 上传最大文件数 | `5` | 否 |
-| `RAG_MAX_UPLOAD_SIZE_MB` | 单文件最大上传大小，单位 MB | `20` | 否 |
-| `RAG_CHUNK_SIZE` | RAG chunk 大小 | `1000` | 否 |
-| `RAG_CHUNK_OVERLAP` | RAG chunk overlap | `120` | 否 |
+| `GLOBAL_DISALLOWED_TOOLS` | 全局禁用工具；空字符串表示全部放开 | `Write,Bash` | 否 |
+
+### Session / 隔离
+
+| 变量名 | 描述 | 默认值 |
+|--------|------|--------|
+| `SESSION_STORE` | `memory` / `file` / `db` | `memory` |
+| `SESSION_FILE_PATH` | file 模式映射文件 | `./.claude/sessions.json` |
+| `SESSION_DB_DSN` | db 模式连接串 | - |
+| `SESSION_ISOLATED_WORKDIR` | 按 `conversationId` 自动隔离 cwd | `false` |
+
+### RAG
+
+| 变量名 | 描述 | 默认值 |
+|--------|------|--------|
+| `RAG_ENABLED` | 是否启用 RAG | `false` |
+| `RAG_STORAGE_DIR` | 状态与向量快照目录 | `${WORK_DIR}/rag` |
+| `RAG_VECTOR_PROVIDER` | 向量库：`local`（可用）；qdrant/pgvector/milvus 预留 | `local` |
+| `RAG_EMBEDDING_PROVIDER` | Embedding：`openai_compatible` 等 | `openai_compatible` |
+| `RAG_PARSER_PROVIDER` | 解析：`local` / `mineru` | `local` |
+| `MINERU_*` | MinerU 地址、密钥、超时、回退 | 见 `.env.example` |
+| `RAG_ALLOWED_EXTENSIONS` | 允许上传扩展名 | `.txt,.md,.pdf,.docx` |
+| `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | 切分参数 | `1000` / `120` |
+| `RAG_MAX_CONCURRENT_INGESTIONS` | 入库并发上限 | `4` |
+| `RAG_MAX_CONCURRENT_QUERIES` | 查询并发上限 | `16` |
 
 ## 项目结构
 
 ```
 ccsdk/
 ├── app/
-│   ├── main.py              # FastAPI 入口
-│   ├── config.py            # 配置管理
-│   ├── auth.py              # API Key 认证
-│   ├── models/              # 数据模型
-│   │   ├── request.py
-│   │   └── response.py
-│   ├── services/            # 业务逻辑
-│   │   ├── agent.py         # Agent 服务
-│   │   ├── session.py       # 会话管理
-│   │   ├── skills.py        # Skills 管理
-│   │   └── history.py       # 历史记录
-│   └── routers/             # API 路由
-│       ├── agent_sdk.py     # /agent-sdk/* 端点
-│       └── skills.py        # /skills/* 端点
+│   ├── main.py                 # FastAPI 入口，注册全部路由
+│   ├── config.py               # 环境变量与 Settings
+│   ├── auth.py                 # X-API-Key 鉴权
+│   ├── models/
+│   │   ├── request.py          # Agent 请求模型
+│   │   ├── response.py         # 通用响应
+│   │   └── rag.py              # RAG 请求/响应模型
+│   ├── routers/
+│   │   ├── agent_sdk.py        # /agent-sdk/*（含 /rag/stream）
+│   │   ├── rag.py              # /rag/*
+│   │   ├── skills.py           # /skills/*
+│   │   └── agent.py            # /agent/* 简化 API
+│   └── services/
+│       ├── agent.py            # Claude Agent SDK 封装
+│       ├── session.py          # conversationId ↔ resume_id
+│       ├── skills.py           # Skills 加载与管理
+│       ├── history.py          # 历史记录读取
+│       └── rag/                # RAG 子系统
+│           ├── ingestion.py    # 上传入库
+│           ├── parser.py       # local / MinerU 文档解析
+│           ├── chunker.py      # 文本切分
+│           ├── embeddings.py   # Embedding provider
+│           ├── vector_store.py # 本地向量检索
+│           ├── retriever.py    # 混合检索 + rerank
+│           ├── mcp.py          # in-process RAG MCP 四件套
+│           ├── agent_runner.py # RAG 流式编排（Claude SDK）
+│           ├── answer_verifier.py
+│           └── ...
 │
 ├── .claude/
-│   └── skills/              # Skills 目录
-│       ├── Topic_Planning/
-│       │   └── SKILL.md
-│       └── example/
-│           └── SKILL.md
+│   ├── skills/                 # Skills（SDK 自动加载）
+│   └── settings.json           # 项目级 Claude Code 配置
 │
-├── .env                     # 环境变量
-├── requirements.txt         # Python 依赖
-├── pyproject.toml          # 项目配置
-└── README.md               # 项目文档
+├── docs/specs/
+│   ├── rag-knowledge-qa.md     # RAG 整体设计
+│   └── rag-document-parsing.md # 文档解析链路
+│
+├── tests/                      # pytest（RAG MVP / parser / smoke）
+├── .env.example
+├── Dockerfile
+├── requirements.txt
+└── README.md
 ```
 
 ## 关键实现细节
@@ -627,13 +720,15 @@ Loaded 2 skills from ./.claude/skills
 |------|--------------|--------|
 | 语言 | TypeScript | Python |
 | 框架 | Bun | FastAPI |
-| Skills 加载 | ✅ SDK 自动加载 | ✅ SDK 自动加载 |
-| Skills 匹配 | ✅ Claude 自动 | ✅ Claude 自动 |
-| SSE 流式响应 | ✅ | ✅ |
-| 会话管理 | ✅ | ✅ |
+| Skills 加载 / 匹配 | ✅ | ✅ |
+| SSE 流式响应 | ✅ | ✅（`eventMode` / `resultMode` 可配） |
+| 会话管理 | ✅ | ✅（`memory` / `file` / `db`） |
 | 中文支持 | ✅ | ✅ |
-| API 端点 | `/agent-sdk/*` | `/agent-sdk/*` |
-| Skills 管理 | 无独立端点 | `/skills/*` |
+| API 端点 | `/agent-sdk/*` | `/agent-sdk/*` + `/skills/*` |
+| RAG 知识库问答 | ❌ | ✅ `/rag/*` + `/agent-sdk/rag/stream` |
+| 文档上传解析 | ❌ | ✅ local / MinerU |
+| RAG MCP 工具 | ❌ | ✅ hybrid_search / read_chunk / list_sources / outline |
+| Skills 管理 API | 无 | `/skills/*` CRUD |
 
 ## 开发
 
@@ -740,6 +835,12 @@ RAG_ALLOWED_EXTENSIONS=.txt,.md,.pdf,.docx
 - [ ] `AGENT_SDK_API_KEY` — 设置 API 认证密钥，否则接口无鉴权
 - [ ] `GLOBAL_DISALLOWED_TOOLS` — 默认 `Write,Bash`；若 Skill 需要写文件，按需调整（如改为仅 `Bash`）
 
+**RAG（启用知识库问答时）**
+- [ ] `RAG_ENABLED=true`
+- [ ] `RAG_STORAGE_DIR` — 与 `WORK_DIR` 一并挂载，避免容器重建丢索引
+- [ ] `RAG_PARSER_PROVIDER=mineru` 时配置 `MINERU_BASE_URL` / `MINERU_API_KEY`
+- [ ] `RAG_EMBEDDING_*` — 生产建议使用真实 embedding API，而非仅本地 hash
+
 **Nginx（Skills 生成文件需要前端访问时必须）**
 - [ ] 配置静态文件映射（见下方 Nginx 配置）
 - [ ] 视频文件需支持 Range 请求
@@ -765,6 +866,8 @@ nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > ccsdk.log 2>&1 &
 
 ### Docker
 
+项目根目录已有 `Dockerfile`。构建时注意 Skills 目录：镜像内默认 `SKILLS_DIR=/app/skills`，生产建议挂载宿主机的 `.claude/skills`：
+
 ```bash
 docker build -t ccsdk .
 
@@ -772,6 +875,8 @@ docker run -d \
   --name ccsdk \
   -p 8000:8000 \
   -v /data/ccsdk:/data/ccsdk \
+  -v "$(pwd)/.claude/skills:/app/.claude/skills:ro" \
+  -e SKILLS_DIR=/app/.claude/skills \
   -e ANTHROPIC_API_KEY=xxx \
   -e ANTHROPIC_BASE_URL=https://api.anthropic.com \
   -e ANTHROPIC_MODEL=claude-sonnet-4-6 \
@@ -781,6 +886,8 @@ docker run -d \
   -e SESSION_ISOLATED_WORKDIR=true \
   -e AGENT_SDK_API_KEY=your-api-key \
   -e GLOBAL_DISALLOWED_TOOLS=Bash \
+  -e RAG_ENABLED=true \
+  -e RAG_STORAGE_DIR=/data/ccsdk/rag \
   ccsdk
 ```
 
@@ -877,7 +984,7 @@ http://your-domain.com/outputs/user-123/assets/ref_portrait.jpg
 
 ### 低优先级
 
-- [ ] **Docker 镜像优化**：当前无 Dockerfile，补充多阶段构建镜像
+- [ ] **Docker 镜像优化**：已有基础 `Dockerfile`，可补充多阶段构建、`.claude/skills` 挂载说明
 - [ ] **Skills 热重载**：当前 Skills 在服务启动时加载，修改后需重启；支持 `POST /skills/reload` 热重载
 - [ ] **`db` 后端迁移脚本**：提供建表 SQL 和迁移脚本，降低 `db` 模式接入成本
 
