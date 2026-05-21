@@ -131,6 +131,8 @@ class RagFileInfo(BaseModel):
     size: int = Field(..., ge=0, description="文件大小，单位字节")
     status: RagFileStatus = Field("pending", description="文件处理状态")
     error: str | None = Field(None, description="文件级错误信息")
+    error_code: str | None = Field(None, alias="errorCode", description="文件级错误代码")
+    error_message: str | None = Field(None, alias="errorMessage", description="文件级错误信息")
 
     class Config:
         populate_by_name = True

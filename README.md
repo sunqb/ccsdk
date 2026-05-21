@@ -387,6 +387,18 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 | `SESSION_FILE_PATH` | `file` 模式下的持久化文件路径 | `./.claude/sessions.json` | 否 |
 | `SESSION_DB_DSN` | `db` 模式下的数据库连接串，如 `mysql+asyncmy://user:pass@host/db` | - | 否 |
 | `SESSION_ISOLATED_WORKDIR` | 是否按 `conversationId` 自动隔离工作目录，`1/true` 启用 | `false` | 否 |
+| `RAG_ENABLED` | 是否启用 RAG 功能 | `false` | 否 |
+| `RAG_STORAGE_DIR` | RAG 本地状态存储目录 | `${WORK_DIR}/rag` | 否 |
+| `RAG_PARSER_PROVIDER` | RAG 文档解析 provider：`local` / `mineru` | `local` | 否 |
+| `MINERU_BASE_URL` | MinerU 服务地址，`RAG_PARSER_PROVIDER=mineru` 时使用 | - | 否 |
+| `MINERU_API_KEY` | MinerU Bearer Token，为空则不发送认证头 | - | 否 |
+| `MINERU_TIMEOUT_SECONDS` | 单文件 MinerU 解析超时，单位秒 | `120` | 否 |
+| `MINERU_FALLBACK_TO_LOCAL` | MinerU 失败时是否回退本地 PDF/DOCX 解析，`1/true` 启用 | `false` | 否 |
+| `RAG_ALLOWED_EXTENSIONS` | RAG 上传允许扩展名 | `.txt,.md,.pdf,.docx` | 否 |
+| `RAG_MAX_UPLOAD_FILES` | 单次 RAG 上传最大文件数 | `5` | 否 |
+| `RAG_MAX_UPLOAD_SIZE_MB` | 单文件最大上传大小，单位 MB | `20` | 否 |
+| `RAG_CHUNK_SIZE` | RAG chunk 大小 | `1000` | 否 |
+| `RAG_CHUNK_OVERLAP` | RAG chunk overlap | `120` | 否 |
 
 ## 项目结构
 
@@ -639,6 +651,37 @@ RAG 流式问答**统一走 Claude Agent SDK + request-scoped in-process MCP**�
 
 - `app/services/rag/agent_runner.py` 中的 `stream_direct`（Anthropic-compatible `/v1/messages` tool loop）为**内部保留实现**，当前 **HTTP 路由未接入**；流式生产/调试入口均使用 `stream_claude_sdk`。
 - `RAG_DIRECT_TIMEOUT_SECONDS` / `RAG_DIRECT_MAX_TOKENS` 仅在与 `stream_direct` 相关的测试或后续扩展时使用，不影响上述流式接口。
+
+### RAG 文档解析器配置
+
+RAG 上传解析由 `RAG_PARSER_PROVIDER` 决定，配置从 `.env` 读取：
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `RAG_PARSER_PROVIDER` | `local` | `local` 使用本地依赖解析 `.txt/.md/.pdf/.docx`；`mineru` 使用 Hybrid 路由，`.txt/.md` 本地解析，`.pdf/.docx` 调用 MinerU。 |
+| `MINERU_BASE_URL` | 空 | MinerU 服务地址，例如 `https://mineru.internal.example`。仅 `RAG_PARSER_PROVIDER=mineru` 时需要。 |
+| `MINERU_API_KEY` | 空 | MinerU Bearer Token；为空则不发送 `Authorization`。 |
+| `MINERU_TIMEOUT_SECONDS` | `120` | 单文件 MinerU 解析超时。 |
+| `MINERU_FALLBACK_TO_LOCAL` | `false` | MinerU 失败时是否回退本地 PDF/DOCX 解析。生产推荐 `false`，让单文件进入失败状态；开发可设为 `true`。 |
+| `RAG_ALLOWED_EXTENSIONS` | `.txt,.md,.pdf,.docx` | 上传允许的扩展名；可显式收窄或扩展。 |
+
+开发/本地默认配置：
+
+```env
+RAG_PARSER_PROVIDER=local
+RAG_ALLOWED_EXTENSIONS=.txt,.md,.pdf,.docx
+```
+
+生产 MinerU 配置示例：
+
+```env
+RAG_PARSER_PROVIDER=mineru
+MINERU_BASE_URL=https://mineru.internal.example
+MINERU_API_KEY=
+MINERU_TIMEOUT_SECONDS=120
+MINERU_FALLBACK_TO_LOCAL=false
+RAG_ALLOWED_EXTENSIONS=.txt,.md,.pdf,.docx
+```
 
 **`allowedTools` 语义（新版 Claude Agent SDK）**
 

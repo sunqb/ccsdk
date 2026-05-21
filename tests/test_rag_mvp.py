@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import nest_asyncio
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+
+nest_asyncio.apply()
 
 from app.models.rag import RagRequestContext, RagSource, RagStreamRequest
 from app.routers import rag as rag_router
@@ -27,6 +30,12 @@ from app.services.rag import (
     TextDocumentParser,
     VectorStore,
     build_provider_info,
+)
+from app.services.rag.parser import (
+    DocumentParser,
+    HybridDocumentParser,
+    LocalDocumentParser,
+    MinerUDocumentParser,
 )
 from app.services.rag.mcp import (
     RAG_EMPTY_PROMPT_HINT,
@@ -253,7 +262,7 @@ async def test_openai_compatible_embedding_provider_handles_errors() -> None:
 
 @pytest.mark.asyncio
 async def test_ingestion_ready_and_partial_ready() -> None:
-    service = RagIngestionService()
+    service = RagIngestionService(parser=TextDocumentParser())
 
     ready = await service.ingest_files(
         [("policy.md", b"# Refund\n\nRefunds are available within 30 days.")],
@@ -272,7 +281,7 @@ async def test_ingestion_ready_and_partial_ready() -> None:
 
 @pytest.mark.asyncio
 async def test_retriever_citations_and_read_chunk() -> None:
-    service = RagIngestionService()
+    service = RagIngestionService(parser=TextDocumentParser())
     response = await service.ingest_files(
         [("policy.md", b"# Refund\n\nRefunds are available within 30 days.")],
         conversation_id="conv_2",
@@ -579,7 +588,7 @@ def test_rag_files_upload_and_status_endpoint(monkeypatch: pytest.MonkeyPatch) -
     from app import auth
     from app.main import app
 
-    service = RagIngestionService()
+    service = RagIngestionService(parser=TextDocumentParser())
     monkeypatch.setattr(auth, "get_api_key", lambda: None)
     monkeypatch.setattr(rag_router, "rag_ingestion_service", service)
 
@@ -617,6 +626,30 @@ def test_rag_files_upload_and_status_endpoint(monkeypatch: pytest.MonkeyPatch) -
     assert invalid_metadata.status_code == 400
 
 
+def test_rag_files_upload_accepts_repeated_file_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import auth
+    from app.main import app
+
+    service = RagIngestionService(parser=TextDocumentParser())
+    monkeypatch.setattr(auth, "get_api_key", lambda: None)
+    monkeypatch.setattr(rag_router, "rag_ingestion_service", service)
+
+    client = TestClient(app)
+    response = client.post(
+        "/rag/files",
+        files=[
+            ("file", ("refund.txt", b"Refunds within 30 days.", "text/plain")),
+            ("file", ("shipping.txt", b"Shipping within 7 days.", "text/plain")),
+        ],
+        data={"conversationId": "conv_repeated_file"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert [file["filename"] for file in body["files"]] == ["refund.txt", "shipping.txt"]
+
+
 def test_rag_files_upload_accepts_docx_and_pdf_when_dependencies_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -626,7 +659,7 @@ def test_rag_files_upload_accepts_docx_and_pdf_when_dependencies_available(
     from app import auth
     from app.main import app
 
-    service = RagIngestionService()
+    service = RagIngestionService(parser=TextDocumentParser())
     monkeypatch.setattr(auth, "get_api_key", lambda: None)
     monkeypatch.setattr(rag_router, "rag_ingestion_service", service)
 
@@ -667,6 +700,178 @@ def test_rag_query_missing_sources_returns_400(monkeypatch: pytest.MonkeyPatch) 
 
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "missing_sources"
+
+
+# ------------------------------------------------------------------
+# Parser abstraction tests
+# ------------------------------------------------------------------
+
+def test_local_document_parser_metadata_contains_parser_field() -> None:
+    parser = LocalDocumentParser()
+    doc = parser.parse_bytes(b"# Hello\n\nWorld", filename="test.md")
+
+    assert doc.metadata["parser"] == "local"
+    assert doc.metadata["extension"] == ".md"
+    assert isinstance(parser.supported_extensions, set)
+    assert ".md" in parser.supported_extensions
+    assert ".txt" in parser.supported_extensions
+    assert ".pdf" in parser.supported_extensions
+    assert ".docx" in parser.supported_extensions
+
+
+def test_local_document_parser_rejects_unsupported_types() -> None:
+    parser = LocalDocumentParser()
+
+    with pytest.raises(ValueError, match="Unsupported local document type"):
+        parser.parse_bytes(b"data", filename="file.xlsx")
+
+
+@pytest.mark.asyncio
+async def test_mineru_parser_returns_markdown_on_success() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/parse"
+        return httpx.Response(
+            200,
+            json={
+                "markdown": "# 第一章 总则\n\n合同有效期为三年。",
+                "page_count": 12,
+                "document_id": "doc_abc123",
+                "version": "1.2.3",
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    parser = MinerUDocumentParser(
+        base_url="https://mineru.internal.example",
+        api_key="secret-key",
+        timeout_seconds=60.0,
+        client=client,
+    )
+
+    doc = parser.parse_bytes(
+        b"fake pdf bytes",
+        filename="contract.pdf",
+    )
+
+    assert doc.text.startswith("# 第一章")
+    assert "合同有效期为三年。" in doc.text
+    assert doc.metadata["parser"] == "mineru"
+    assert doc.metadata["pageCount"] == 12
+    assert doc.metadata["documentId"] == "doc_abc123"
+    assert doc.metadata["parserVersion"] == "1.2.3"
+    assert doc.metadata["extension"] == ".pdf"
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_mineru_parser_handles_wrapped_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "content": "# 合同条款\n\n付款方式为银行转账。",
+                "pageCount": 5,
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    parser = MinerUDocumentParser(
+        base_url="https://mineru.internal.example",
+        client=client,
+    )
+
+    doc = parser.parse_bytes(b"fake docx bytes", filename="agreement.docx")
+
+    assert "合同条款" in doc.text
+    assert doc.metadata["pageCount"] == 5
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_mineru_parser_raises_on_http_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "internal error"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    parser = MinerUDocumentParser(
+        base_url="https://mineru.internal.example",
+        client=client,
+    )
+
+    with pytest.raises(ValueError, match="MinerU returned HTTP 500"):
+        parser.parse_bytes(b"fake", filename="doc.pdf")
+
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_mineru_parser_falls_back_to_local_on_failure() -> None:
+    pytest.importorskip("reportlab.pdfgen.canvas")
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "service unavailable"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    parser = MinerUDocumentParser(
+        base_url="https://mineru.internal.example",
+        fallback_to_local=True,
+        client=client,
+    )
+
+    real_pdf_bytes = _build_pdf_bytes("Fallback PDF content via local parser.")
+
+    doc = parser.parse_bytes(real_pdf_bytes, filename="fallback.pdf")
+
+    assert doc.metadata["parser"] == "local"
+    assert doc.metadata["parserFallbackFrom"] == "mineru"
+    assert "Fallback PDF content" in doc.text
+    client.close()
+
+
+def test_hybrid_document_parser_routes_to_local_for_txt_md() -> None:
+    parser = HybridDocumentParser()
+
+    assert ".txt" in parser.supported_extensions
+    assert ".md" in parser.supported_extensions
+
+    doc = parser.parse_bytes(b"Hello world", filename="note.txt")
+    assert doc.metadata["parser"] == "local"
+
+
+def test_hybrid_document_parser_rejects_pdf_without_mineru() -> None:
+    parser = HybridDocumentParser()
+
+    with pytest.raises(ValueError, match="MinerU is not configured"):
+        parser.parse_bytes(b"fake", filename="doc.pdf")
+
+
+def test_hybrid_document_parser_with_mineru_config() -> None:
+    parser = HybridDocumentParser(
+        mineru_base_url="https://mineru.internal.example",
+        mineru_api_key="key",
+        mineru_timeout_seconds=30.0,
+        mineru_fallback_to_local=False,
+    )
+
+    assert ".pdf" in parser.supported_extensions
+    assert ".docx" in parser.supported_extensions
+    assert ".txt" in parser.supported_extensions
+
+
+def test_document_parser_protocol_is_runtime_checkable() -> None:
+    local = LocalDocumentParser()
+    hybrid = HybridDocumentParser()
+
+    assert isinstance(local, DocumentParser)
+    assert isinstance(hybrid, DocumentParser)
+
+
+def test_ingestion_service_builds_parser_from_config_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.rag_parser_provider", "local")
+    service = RagIngestionService()
+
+    assert isinstance(service.parser, LocalDocumentParser)
+    assert service.parser.supported_extensions == {".txt", ".md", ".pdf", ".docx"}
+
 
 
 def test_rag_query_returns_answer_and_citations_with_fake_agent(

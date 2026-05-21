@@ -7,11 +7,12 @@ RAG API 路由 - 文件上传、索引状态与流式问答。
 """
 import json
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from ..auth import verify_api_key
 from ..config import settings
@@ -231,25 +232,74 @@ async def _generate_rag_agent_stream(request: RagStreamRequest) -> AsyncGenerato
         yield _sse_event("error", {"code": "rate_limited", "message": str(exc), "requestId": request_id})
 
 
-@router.post("/files", dependencies=[Depends(verify_api_key)])
+@router.post(
+    "/files",
+    summary="上传 RAG 文档并创建 fileSet",
+    description=(
+        "上传一个或多个文档，服务端会完成解析、切分、embedding 和索引，"
+        "并返回后续问答使用的 fileSetId。该接口只负责文档入库，不直接回答问题；"
+        "拿到 fileSetId 后请调用 /agent-sdk/rag/stream 或 /rag/query 进行问答。"
+        "兼容 file（单文件）和 files（多文件）两个 multipart 字段。"
+    ),
+    dependencies=[Depends(verify_api_key)],
+)
 async def upload_rag_files(
-    files: list[UploadFile] = File(...),
-    conversation_id: str | None = Form(None, alias="conversationId"),
-    metadata: str | None = Form(None),
+    request: Request,
+    file: Annotated[
+        UploadFile | None,
+        File(
+            description=(
+                "单文件上传字段。若你的 OpenAPI 工具不能正确识别 files 多文件数组，"
+                "请使用这个字段上传一个文档。"
+            ),
+        ),
+    ] = None,
+    conversation_id: Annotated[
+        str | None,
+        Form(alias="conversationId", description="可选会话 ID，用于把 fileSet 关联到一次会话。"),
+    ] = None,
+    metadata: Annotated[
+        str | None,
+        Form(description="可选 JSON 对象字符串，会合并到文档和 chunk metadata 中。"),
+    ] = None,
 ) -> UploadFileResponse:
     """
-    【前端可用】上传文件并建立临时 RAG fileSet。
+    【前端可用】上传文档并建立临时 RAG fileSet。
 
     适用场景：
-    - 前端上传 md/txt 等文件，随后通过 fileSetId 调用 `/agent-sdk/rag/stream`。
-    - 临时文件问答，不一定创建长期知识库。
+    - 前端上传 txt/md/pdf/docx 等文档，随后通过 fileSetId 调用 `/agent-sdk/rag/stream`。
+    - 单文件可使用 multipart 字段 `file`；多文件可重复使用 multipart 字段 `files`。
+    - 只做文档解析与索引，不直接进行问答；问答接口是 `/agent-sdk/rag/stream` 或 `/rag/query`。
+    - 临时文档问答，不一定创建长期知识库。
 
     返回值中的 `fileSetId` 是后续 RAG 问答的主要输入。
     """
     parsed_metadata = _parse_metadata(metadata)
     ingest_files: list[IngestFile] = []
 
-    for upload_file in files:
+    upload_files: list[UploadFile] = []
+    form = await request.form()
+    # OpenAPI exposes a single `file` field for better UI compatibility, but clients may
+    # repeat the same multipart field to upload multiple files.
+    for item in form.getlist("file"):
+        if isinstance(item, StarletteUploadFile):
+            upload_files.append(item)
+
+    # Backward-compatible multi-file support: older clients may repeat multipart field "files".
+    # Empty fields such as `-F files=` are ignored instead of failing validation.
+    for item in form.getlist("files"):
+        if isinstance(item, StarletteUploadFile):
+            upload_files.append(item)
+
+    # Some clients may send a single file in a way that FastAPI binds but Starlette's form
+    # cache does not expose as expected. Keep the typed parameter as a final fallback.
+    if not upload_files and file is not None:
+        upload_files.append(file)
+
+    if not upload_files:
+        raise HTTPException(status_code=400, detail="Provide at least one file")
+
+    for upload_file in upload_files:
         content = await upload_file.read()
         ingest_files.append(
             IngestFile(

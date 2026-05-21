@@ -17,7 +17,7 @@ from ...models.rag import (
 )
 from .chunker import RagChunk, TextChunker
 from .embeddings import EmbeddingProvider, LocalHashEmbeddingProvider
-from .parser import TextDocumentParser
+from .parser import DocumentParser, HybridDocumentParser, LocalDocumentParser
 from .state_store import SQLiteRagStateStore
 from .vector_store import LocalVectorStore, VectorStore
 
@@ -82,13 +82,13 @@ class RagIngestionService:
     def __init__(
         self,
         *,
-        parser: TextDocumentParser | None = None,
+        parser: DocumentParser | None = None,
         chunker: TextChunker | None = None,
         embedder: EmbeddingProvider | None = None,
         vector_store: VectorStore | None = None,
         state_store: SQLiteRagStateStore | None = None,
     ) -> None:
-        self.parser = parser or TextDocumentParser()
+        self.parser = parser or self._build_parser()
         self.chunker = chunker or TextChunker(
             chunk_size=settings.rag_chunk_size,
             chunk_overlap=settings.rag_chunk_overlap,
@@ -157,9 +157,13 @@ class RagIngestionService:
                     metadata=metadata or {},
                 )
             except Exception as exc:  # noqa: BLE001 - capture per-file ingestion failures
+                failed_stage = file_info.status
                 file_info.status = "failed"
-                file_info.error = str(exc)
-                record.errors.append(f"{input_file.filename}: {exc}")
+                error_code = self._error_code_for_status(failed_stage)
+                file_info.error_code = error_code
+                file_info.error_message = str(exc)
+                file_info.error = f"{error_code}: {exc}"
+                record.errors.append(f"{input_file.filename}: {file_info.error}")
                 self._touch(record)
 
         self._finalize_status(record)
@@ -423,6 +427,32 @@ class RagIngestionService:
             raw_chunks = snapshot.get("chunks", [])
             if isinstance(raw_chunks, list):
                 self.vector_store.load_records([item for item in raw_chunks if isinstance(item, dict)])
+
+    def _build_parser(self) -> DocumentParser:
+        """Build the document parser based on RAG_PARSER_PROVIDER setting."""
+        provider = settings.rag_parser_provider
+        if provider == "mineru":
+            return HybridDocumentParser(
+                mineru_base_url=settings.mineru_base_url,
+                mineru_api_key=settings.mineru_api_key,
+                mineru_timeout_seconds=settings.mineru_timeout_seconds,
+                mineru_fallback_to_local=settings.mineru_fallback_to_local,
+            )
+        if provider == "local":
+            return LocalDocumentParser()
+        raise ValueError(f"Unsupported RAG_PARSER_PROVIDER: {provider}")
+
+    @staticmethod
+    def _error_code_for_status(status: RagFileStatus) -> str:
+        if status == "parsing":
+            return "parse_failed"
+        if status == "chunking":
+            return "chunk_failed"
+        if status == "embedding":
+            return "embedding_failed"
+        if status == "indexing":
+            return "index_failed"
+        return "ingestion_failed"
 
     @staticmethod
     def _normalize_file(file: IngestFile | tuple[str, bytes]) -> IngestFile:

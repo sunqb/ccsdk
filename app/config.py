@@ -30,6 +30,14 @@ def _csv_list(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _default_rag_allowed_extensions() -> list[str]:
+    configured = os.getenv("RAG_ALLOWED_EXTENSIONS")
+    if configured is not None:
+        return _csv_list(configured)
+
+    return [".txt", ".md", ".pdf", ".docx"]
+
+
 print("="*50)
 print(f"[Config] 加载 .env 文件: {env_path}")
 print(f"[Config] .env 文件存在: {env_path.exists()}")
@@ -193,7 +201,7 @@ class Settings:
         default_factory=lambda: int(os.getenv("RAG_MAX_UPLOAD_SIZE_MB", "20"))
     )
     rag_allowed_extensions: list[str] = field(
-        default_factory=lambda: _csv_list(os.getenv("RAG_ALLOWED_EXTENSIONS", ".txt,.md"))
+        default_factory=_default_rag_allowed_extensions
     )
     rag_max_concurrent_ingestions: int = field(
         default_factory=lambda: int(os.getenv("RAG_MAX_CONCURRENT_INGESTIONS", "4"))
@@ -204,6 +212,24 @@ class Settings:
     rag_qdrant_url: str | None = field(default_factory=lambda: os.getenv("RAG_QDRANT_URL"))
     rag_pgvector_dsn: str | None = field(default_factory=lambda: os.getenv("RAG_PGVECTOR_DSN"))
     rag_milvus_uri: str | None = field(default_factory=lambda: os.getenv("RAG_MILVUS_URI"))
+
+    # RAG 文档解析器配置
+    # 提供者：local（默认，本地解析 .txt/.md/.pdf/.docx）/ mineru（调用公司 MinerU 服务解析 .pdf/.docx）
+    rag_parser_provider: str = field(
+        default_factory=lambda: os.getenv("RAG_PARSER_PROVIDER", "local").strip().lower()
+    )
+    mineru_base_url: str | None = field(
+        default_factory=lambda: os.getenv("MINERU_BASE_URL")
+    )
+    mineru_api_key: str | None = field(
+        default_factory=lambda: os.getenv("MINERU_API_KEY")
+    )
+    mineru_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("MINERU_TIMEOUT_SECONDS", "120"))
+    )
+    mineru_fallback_to_local: bool = field(
+        default_factory=lambda: _env_bool("MINERU_FALLBACK_TO_LOCAL", "false")
+    )
 
     # 默认允许的工具
     # 说明：为了避免"只想要代码展示"却在服务器上落盘生成文件，默认禁用 Write/Bash。
