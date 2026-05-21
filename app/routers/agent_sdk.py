@@ -1,16 +1,25 @@
 """
-Agent SDK API 路由 - 兼容原 cc-agent-sdk API
+Agent SDK API 路由。
+
+定位：正式对外/前端推荐入口。
+- `/agent-sdk/stream`：普通 Agent + Skills 对话。
+- `/agent-sdk/rag/stream`：RAG 文件/知识库 + Agent + Skills 对话。
+- `/agent-sdk/history|projects|conversations`：Claude Code 历史与会话辅助查询。
+
+其他 `/agent/*`、`/rag/agent/stream` 接口保留为 legacy / 开发测试入口。
 """
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator, Optional
 
+from ..models.rag import RagStreamRequest
 from ..models.request import StreamRequest, HistoryRequest
 from ..services.agent import agent_service
 from ..services.history import history_service
 from ..services.session import session_manager
 from ..auth import verify_api_key
 from ..config import settings
+from .rag import _generate_rag_agent_stream
 
 router = APIRouter(prefix="/agent-sdk", tags=["Agent SDK"])
 
@@ -32,9 +41,9 @@ async def _generate_sse_stream(
     event_mode: str = "full",
 ) -> AsyncGenerator[str, None]:
     """生成 SSE 事件流"""
-    # 默认工具列表：空列表表示使用 SDK 默认工具（完整工具集）
-    # 如果用户明确传递 ["Skill"]，则只允许 Skill
-    tools = allowed_tools if allowed_tools is not None else None
+    # 新版 SDK 语义：[] 表示 Skills / 原生工具全开；非空列表为白名单限制。
+    # 请求未传时由上层保持 None，进入 agent_service 后归一化为 []。
+    tools = allowed_tools if allowed_tools is not None else []
 
     effective_event_mode = (event_mode or "full").strip().lower()
     if effective_event_mode not in ("full", "text_only"):
@@ -71,7 +80,15 @@ async def _generate_sse_stream(
 @router.post("/stream", dependencies=[Depends(verify_api_key)])
 async def agent_sdk_stream(request: StreamRequest):
     """
-    Agent SDK 流式端点 - 兼容原 cc-agent-sdk API
+    【正式前端入口】普通 Agent SDK 流式对话。
+
+    适用场景：
+    - 日常 Agent 对话。
+    - 自动识别并使用项目 Skills。
+    - 需要请求级覆盖 model/baseURL/apiKey/cwd/systemPrompt/settingSources。
+
+    不适用场景：
+    - 需要基于上传文件或知识库问答时，请使用 `/agent-sdk/rag/stream`。
 
     接收用户消息，返回 text/event-stream，逐步推送 Claude Agent SDK 原始事件：
     - stream_event: 流事件
@@ -88,7 +105,7 @@ async def agent_sdk_stream(request: StreamRequest):
     - baseURL: 可选，覆盖默认 API URL
     - apiKey: 可选，覆盖默认 API Key
     - options: 透传给 claude-agent-sdk 的选项
-      - allowedTools (默认 ["Skill"])
+      - allowedTools：推荐传 `[]` 表示 Skills 全开；非空列表表示白名单；未传则服务端归一化为 `[]`
       - disallowedTools
       - tools
       - maxTurns
@@ -155,6 +172,42 @@ async def agent_sdk_stream(request: StreamRequest):
     )
 
 
+@router.post("/rag/stream", dependencies=[Depends(verify_api_key)])
+async def agent_sdk_rag_stream(request: RagStreamRequest):
+    """
+    【正式前端入口】RAG + Agent SDK + Skills 流式问答。
+
+    适用场景：
+    - 用户上传文件后，基于 fileSetId 进行问答。
+    - 基于 knowledgeBaseId 进行知识库问答。
+    - 同时需要 Agent SDK 原生能力，例如读取/匹配项目 Skills。
+
+    与 `/agent-sdk/stream` 的区别：
+    - 本接口请求模型是 `RagStreamRequest`，包含 fileSetId/knowledgeBaseId/sources/options。
+    - 本接口会注入 RAG 上下文，回答可返回 RAG 专用 result 结构。
+    - 服务端固定 `allowed_tools=[]`（Skills 全开），RAG 能力通过 request-scoped `mcp_servers` 注入；
+      **不要**在请求里传 `allowedTools: null` 来表达「全开」，应使用 `[]` 保持语义一致。
+
+    与 `/rag/agent/stream` 的区别：
+    - 本接口是前端推荐入口。
+    - `/rag/agent/stream` 仅保留为开发测试/诊断入口。
+
+    This is the preferred public entrypoint for asking questions that need both
+    uploaded/knowledge-base RAG context and native Agent SDK capabilities such
+    as project Skills. The legacy `/rag/agent/stream` endpoint remains available
+    for development and diagnostics.
+    """
+    return StreamingResponse(
+        _generate_rag_agent_stream(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/history", dependencies=[Depends(verify_api_key)])
 async def get_history(
     conversation_id: str = Query(
@@ -172,7 +225,13 @@ async def get_history(
     raw: bool = Query(False, description="是否返回完整事件数组")
 ):
     """
-    历史记录查询端点
+    【辅助查询】查询 Claude Code 会话历史。
+
+    适用场景：
+    - 前端需要展示历史消息。
+    - 调试 conversationId 与 Claude Code session_id 映射。
+
+    注意：这是历史查询接口，不触发新的 Agent 推理。
 
     读取 ~/.claude/projects/<project>/<conversationId>.jsonl 中的会话数据
 
@@ -215,7 +274,9 @@ async def get_history(
 @router.get("/projects", dependencies=[Depends(verify_api_key)])
 async def list_projects():
     """
-    列出所有项目
+    【辅助查询】列出 Claude Code 历史项目目录。
+
+    适用场景：开发/调试历史数据归属；通常不是业务前端主流程接口。
 
     返回 ~/.claude/projects/ 下所有项目目录
     """
@@ -232,7 +293,9 @@ async def list_conversations(
     limit: int = Query(100, description="返回会话数量限制")
 ):
     """
-    列出所有会话
+    【辅助查询】列出 Claude Code 历史会话文件。
+
+    适用场景：开发/调试会话历史；通常不是业务前端主流程接口。
 
     返回 ~/.claude/projects/ 下所有 .jsonl 文件
     """

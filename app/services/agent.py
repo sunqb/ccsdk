@@ -1,19 +1,21 @@
 """
 Agent 服务 - 核心 Claude Agent SDK 封装
 """
-import asyncio
 import json
 import logging
 import os
 import tempfile
 import uuid
-from typing import Optional, Any, AsyncGenerator
+import traceback
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from importlib.util import find_spec
 from pathlib import Path
+from typing import Any
 
 from ..config import settings
-from .session import session_manager, Session
 from .history import history_service
+from .session import Session, session_manager
 from .virtual_space import virtual_space_manager
 from .docker_sandbox import docker_sandbox_runner
 
@@ -22,13 +24,33 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
 
+def _format_exception_tree(exc: BaseException, indent: int = 0) -> str:
+    """Format nested ExceptionGroup details that str(exc) hides."""
+    prefix = "  " * indent
+    lines = [f"{prefix}{type(exc).__name__}: {exc}"]
+    nested = getattr(exc, "exceptions", None)
+    if isinstance(nested, tuple):
+        for index, child in enumerate(nested, start=1):
+            lines.append(f"{prefix}sub-exception {index}:")
+            lines.append(_format_exception_tree(child, indent + 1))
+    return "\n".join(lines)
+
+
+def _is_sdk_control_channel_close_race(error_detail: str) -> bool:
+    """Detect Claude Agent SDK MCP control-channel close race errors."""
+    return (
+        "ProcessTransport is not ready for writing" in error_detail
+        and "CLIConnectionError" in error_detail
+    )
+
+
 @dataclass
 class AgentEvent:
     """Agent 事件"""
     type: str
-    subtype: Optional[str] = None
+    subtype: str | None = None
     data: Any = None
-    conversation_id: Optional[str] = None
+    conversation_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -92,18 +114,19 @@ class AgentService:
     async def query_stream(
         self,
         prompt: str,
-        conversation_id: Optional[str] = None,
-        space_id: Optional[str] = None,
-        allowed_tools: Optional[list[str]] = None,
-        disallowed_tools: Optional[list[str]] = None,
-        max_turns: Optional[int] = None,
-        cwd: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-        setting_sources: Optional[list[str]] = None,
-        model: Optional[str] = None,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        result_mode: Optional[str] = None,
+        conversation_id: str | None = None,
+        space_id: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        max_turns: int | None = None,
+        cwd: str | None = None,
+        system_prompt: str | None = None,
+        setting_sources: list[str] | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        result_mode: str | None = None,
+        mcp_servers: dict[str, Any] | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """
         流式查询 Claude Agent
@@ -165,9 +188,10 @@ class AgentService:
             )
 
         # 构建工具配置
-        # None 表示使用 SDK 默认工具集（完整工具）
-        # 空列表或明确指定的列表则使用用户指定的
-        tools = allowed_tools
+        # 新版 SDK 语义：[] 表示 Skills / 原生工具全开（推荐显式传 []）。
+        # 请求层 None 会在进入本方法前被上层归一化为 []（与 [] 效果相同）。
+        # 只有非空列表才表示白名单限制。
+        tools = allowed_tools if allowed_tools is not None else []
 
         # 全局安全模式：强制禁用写入/执行类工具，避免在服务器落盘或执行任意命令
         effective_disallowed_tools: list[str] = []
@@ -252,11 +276,7 @@ class AgentService:
                 return
 
             # 尝试导入 claude_agent_sdk
-            try:
-                from claude_agent_sdk import query, ClaudeAgentOptions
-                sdk_available = True
-            except ImportError:
-                sdk_available = False
+            sdk_available = find_spec("claude_agent_sdk") is not None
 
             if sdk_available:
                 # 使用 Claude Agent SDK
@@ -272,6 +292,7 @@ class AgentService:
                     base_url=base_url,
                     api_key=api_key,
                     result_mode=result_mode,
+                    mcp_servers=mcp_servers,
                 ):
                     yield event
             else:
@@ -293,18 +314,19 @@ class AgentService:
         self,
         prompt: str,
         session: Session,
-        allowed_tools: Optional[list[str]],
-        disallowed_tools: Optional[list[str]],
-        max_turns: Optional[int],
-        system_prompt: Optional[str] = None,
-        setting_sources: Optional[list[str]] = None,
-        model: Optional[str] = None,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        result_mode: Optional[str] = None,
+        allowed_tools: list[str],
+        disallowed_tools: list[str] | None,
+        max_turns: int | None,
+        system_prompt: str | None = None,
+        setting_sources: list[str] | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        result_mode: str | None = None,
+        mcp_servers: dict[str, Any] | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """使用 Claude Agent SDK 执行查询"""
-        from claude_agent_sdk import query, ClaudeAgentOptions
+        from claude_agent_sdk import ClaudeAgentOptions, query
 
         # 发送开始事件
         yield AgentEvent(
@@ -402,9 +424,6 @@ class AgentService:
         logger.info(f"  work_dir: {settings.work_dir}")
         logger.info("="*50)
 
-        effective_allowed_tools = allowed_tools or []
-        effective_disallowed_tools = disallowed_tools or []
-
         # 构建选项
         # setting_sources 控制配置加载
         # - "project": {cwd}/.claude/ 配置（加载 skills）
@@ -469,6 +488,12 @@ class AgentService:
             except Exception as e:
                 logger.warning(f"Invalid AGENT_SDK_MCP_SERVERS_JSON: {e}")
 
+        effective_mcp_servers: dict[str, Any] = {}
+        if isinstance(injected_mcp_servers, dict):
+            effective_mcp_servers.update(injected_mcp_servers)
+        if mcp_servers:
+            effective_mcp_servers.update(mcp_servers)
+
         extra_args: dict[str, str | None] = {}
         if settings.agent_sdk_strict_mcp_config:
             extra_args["strict-mcp-config"] = None
@@ -480,20 +505,31 @@ class AgentService:
             logger.error(f"[CLI stderr] {msg}")
             stderr_lines.append(msg)
 
+        include_partial_messages = not bool(effective_mcp_servers)
+        logger.info(
+            "[ClaudeAgentOptions] include_partial_messages=%s (mcp_servers=%s)",
+            include_partial_messages,
+            list(effective_mcp_servers.keys()),
+        )
+
+        sdk_allowed_tools = allowed_tools if allowed_tools is not None else []
+        logger.info("[ClaudeAgentOptions] sdk_allowed_tools=%s", sdk_allowed_tools)
+
         options = ClaudeAgentOptions(
             cwd=session.cwd or settings.work_dir,
-            allowed_tools=effective_allowed_tools,
-            disallowed_tools=effective_disallowed_tools,
+            allowed_tools=sdk_allowed_tools,
+            disallowed_tools=disallowed_tools or [],
             setting_sources=effective_setting_sources,
             env=env,
             model=effective_model,
             # 权限模式：bypassPermissions 跳过交互式权限确认
             permission_mode="bypassPermissions",
-            # 关键：开启 partial messages，Claude Code CLI 才会输出逐 token 的 stream_event
-            # 否则 SDK 只会在 AssistantMessage 完整生成后一次性返回 TextBlock，导致"假流式"
-            include_partial_messages=True,
+            # 关键：开启 partial messages，Claude Code CLI 才会输出逐 token 的 stream_event。
+            # 但 SDK MCP server 依赖双向 control channel；partial streaming 在 MCP 场景下
+            # 容易与 close/cancel 时序冲突，导致 ProcessTransport is not ready for writing。
+            include_partial_messages=include_partial_messages,
             settings=injected_settings_str,
-            mcp_servers=injected_mcp_servers or {},
+            mcp_servers=effective_mcp_servers,
             extra_args=extra_args,
             stderr=stderr_callback,
         )
@@ -709,10 +745,47 @@ class AgentService:
                     )
 
         except Exception as e:
-            error_detail = str(e)
+            error_detail = _format_exception_tree(e)
+            error_detail += "\n[Traceback]\n" + "".join(
+                traceback.format_exception(type(e), e, e.__traceback__)
+            )
             if stderr_lines:
                 error_detail += "\n[CLI stderr]\n" + "\n".join(stderr_lines)
             logger.error(f"[_query_with_sdk] error: {error_detail}")
+
+            # Claude Agent SDK can raise from query.close() after MCP control responses
+            # if the subprocess transport has already closed. Do not surface that race
+            # as a fatal user error when useful output was already produced.
+            if _is_sdk_control_channel_close_race(error_detail):
+                logger.warning(
+                    "[_query_with_sdk] SDK control channel close race detected; "
+                    "streamed_any_text_delta=%s result_text_len=%s",
+                    streamed_any_text_delta,
+                    len(result_text),
+                )
+                if streamed_any_text_delta or result_text:
+                    yield AgentEvent(
+                        type="stream_event",
+                        subtype="end",
+                        data={
+                            "message": "Query completed; ignored SDK control channel close race",
+                            "sdkCloseRaceIgnored": True,
+                        },
+                        conversation_id=session.id,
+                    )
+                    return
+
+                yield AgentEvent(
+                    type="error",
+                    data={
+                        "message": "Claude Agent SDK control channel closed before MCP control response was written.",
+                        "code": "sdk_control_channel_close_race",
+                        "recoverable": True,
+                        "detail": error_detail,
+                    },
+                    conversation_id=session.id,
+                )
+                return
 
             # 历史会话损坏（工具调用中断导致 tool_calls 无对应 tool_result）时，
             # 清除 resume_id 让下次请求以新 session 启动，conversationId 保持不变。
@@ -739,14 +812,14 @@ class AgentService:
     async def query(
         self,
         prompt: str,
-        conversation_id: Optional[str] = None,
-        space_id: Optional[str] = None,
-        allowed_tools: Optional[list[str]] = None,
-        disallowed_tools: Optional[list[str]] = None,
-        max_turns: Optional[int] = None,
-        cwd: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-        setting_sources: Optional[list[str]] = None,
+        conversation_id: str | None = None,
+        space_id: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        max_turns: int | None = None,
+        cwd: str | None = None,
+        system_prompt: str | None = None,
+        setting_sources: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         非流式查询 Claude Agent

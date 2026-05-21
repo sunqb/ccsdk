@@ -1,5 +1,13 @@
 """
-Agent API 路由
+Legacy Agent API 路由。
+
+定位：早期简化版接口，仅建议开发测试或兼容旧调用使用。
+正式前端接入请使用：
+- 普通 Agent / Skills：`POST /agent-sdk/stream`
+- RAG + Agent / Skills：`POST /agent-sdk/rag/stream`
+
+注意：本路由参数能力较少，且不包含 `/agent-sdk` 的完整鉴权、model/baseURL/apiKey、
+systemPrompt、settingSources、eventMode/resultMode 等能力。
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -37,7 +45,14 @@ async def _generate_sse_events(
 @router.post("/query")
 async def query_agent(request: QueryRequest) -> QueryResponse:
     """
-    非流式查询 Agent
+    【Legacy / 开发测试】非流式查询 Agent。
+
+    适用场景：简单调试或兼容旧客户端。
+
+    不推荐作为新前端入口：
+    - 参数能力少于 `/agent-sdk/stream`。
+    - 当前不会传递 systemPrompt/settingSources/model/baseURL/apiKey。
+    - 新业务请优先使用 `/agent-sdk/stream`。
 
     - **prompt**: 用户输入的提示词
     - **conversationId**: 可选，会话ID用于继续之前的对话
@@ -68,7 +83,14 @@ async def query_agent(request: QueryRequest) -> QueryResponse:
 @router.post("/query/stream")
 async def query_agent_stream(request: QueryRequest):
     """
-    流式查询 Agent（SSE）
+    【Legacy / 开发测试】简化版流式查询 Agent（SSE）。
+
+    适用场景：简单流式调试或兼容旧客户端。
+
+    不推荐作为新前端入口：
+    - 普通 Agent / Skills 请使用 `/agent-sdk/stream`。
+    - RAG + Agent / Skills 请使用 `/agent-sdk/rag/stream`。
+    - 本接口不会传递 `/agent-sdk/stream` 支持的完整请求级配置。
 
     返回 `text/event-stream` 格式的事件流，事件类型包括：
     - **stream_event**: 流事件（start, end 等）

@@ -116,3 +116,6 @@ dmypy.json
 # Project specific
 workspace/
 *.db
+
+# Data
+.claude/sessions.json
