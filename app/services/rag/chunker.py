@@ -56,13 +56,15 @@ class TextChunker:
             heading_path = self._heading_path_for_block(block, current_heading_path)
 
             if current_blocks and current_size + block_size + 2 > self.chunk_size:
+                parent_text = "\n\n".join(current_blocks)
                 chunks.append(
                     self._build_chunk(
                         document=document,
-                        text="\n\n".join(current_blocks),
+                        text=parent_text,
                         chunk_index=len(chunks),
                         source_file_id=source_file_id,
                         heading_path=current_heading_path,
+                        parent_text=parent_text,
                     )
                 )
                 current_blocks = self._overlap_blocks(current_blocks)
@@ -75,13 +77,15 @@ class TextChunker:
                     current_size = 0
                     carried_overlap = False
                 elif current_blocks:
+                    parent_text = "\n\n".join(current_blocks)
                     chunks.append(
                         self._build_chunk(
                             document=document,
-                            text="\n\n".join(current_blocks),
+                            text=parent_text,
                             chunk_index=len(chunks),
                             source_file_id=source_file_id,
                             heading_path=current_heading_path,
+                            parent_text=parent_text,
                         )
                     )
                     current_blocks = []
@@ -95,6 +99,7 @@ class TextChunker:
                             chunk_index=len(chunks),
                             source_file_id=source_file_id,
                             heading_path=heading_path,
+                            parent_text=block,
                         )
                     )
                 current_heading_path = heading_path
@@ -106,13 +111,15 @@ class TextChunker:
             carried_overlap = False
 
         if current_blocks:
+            parent_text = "\n\n".join(current_blocks)
             chunks.append(
                 self._build_chunk(
                     document=document,
-                    text="\n\n".join(current_blocks),
+                    text=parent_text,
                     chunk_index=len(chunks),
                     source_file_id=source_file_id,
                     heading_path=current_heading_path,
+                    parent_text=parent_text,
                 )
             )
 
@@ -196,13 +203,40 @@ class TextChunker:
         chunk_index: int,
         source_file_id: str | None,
         heading_path: list[str],
+        parent_text: str,
     ) -> RagChunk:
         clean_text = text.strip()
+        clean_parent_text = parent_text.strip()
+        start_offset = document.text.find(clean_text)
+        if start_offset < 0:
+            start_offset = None
+        end_offset = start_offset + len(clean_text) if start_offset is not None else None
+        document_id = str(
+            document.metadata.get("documentId")
+            or document.metadata.get("document_id")
+            or document.metadata.get("fileId")
+            or document.filename
+        )
+        parent_chunk_id = self._make_chunk_id(
+            f"{document_id}:parent",
+            len(heading_path),
+            clean_parent_text or clean_text,
+        )
         metadata = {
             **document.metadata,
+            "documentId": document_id,
             "filename": document.filename,
             "mime_type": document.mime_type,
             "heading_path": heading_path,
+            "headingPath": heading_path,
+            "sectionTitle": heading_path[-1] if heading_path else None,
+            "parentChunkId": parent_chunk_id,
+            "parent_chunk_id": parent_chunk_id,
+            "parentChunkText": clean_parent_text,
+            "chunkRole": "child",
+            "startOffset": start_offset,
+            "endOffset": end_offset,
+            "contentType": self._content_type(clean_text),
         }
         chunk_id = self._make_chunk_id(document.filename, chunk_index, clean_text)
         return RagChunk(
@@ -218,3 +252,14 @@ class TextChunker:
     def _make_chunk_id(filename: str, chunk_index: int, text: str) -> str:
         digest = hashlib.sha1(f"{filename}:{chunk_index}:{text}".encode()).hexdigest()
         return f"chunk_{digest[:16]}"
+
+    @staticmethod
+    def _content_type(text: str) -> str:
+        stripped = text.strip()
+        if HEADING_RE.match(stripped.split("\n", 1)[0] if stripped else ""):
+            return "section"
+        if "|" in stripped and "\n" in stripped:
+            return "table"
+        if "```" in stripped:
+            return "code"
+        return "text"

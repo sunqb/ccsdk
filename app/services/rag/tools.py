@@ -10,7 +10,7 @@ from typing import Any
 
 from ...models.rag import RagCitation, RagRequestContext
 from .chunker import RagChunk
-from .retriever import RagRetriever, rag_retriever
+from .retriever import RagRetriever, RetrievalTrace, rag_retriever
 from .vector_store import SearchResult
 
 
@@ -26,9 +26,15 @@ class RagToolService:
         query: str,
         context: RagRequestContext,
         top_k: int | None = None,
+        retrieve_top_k: int | None = None,
+        final_top_k: int | None = None,
+        hybrid: bool = True,
         query_rewrite: bool = False,
+        multi_query: bool = False,
         rerank: bool = False,
+        rerank_provider: str | None = None,
         context_window: int = 0,
+        trace: RetrievalTrace | None = None,
     ) -> list[SearchResult]:
         """Search within the sources allowed by the request context."""
         bounded_top_k = min(top_k or context.top_k, context.top_k)
@@ -36,9 +42,15 @@ class RagToolService:
             query,
             sources=context.sources,
             top_k=bounded_top_k,
+            retrieve_top_k=retrieve_top_k,
+            final_top_k=final_top_k,
+            hybrid=hybrid,
             query_rewrite=query_rewrite,
+            multi_query=multi_query,
             rerank=rerank,
+            rerank_provider=rerank_provider,
             context_window=context_window,
+            trace=trace,
         )
 
     async def read_chunk(
@@ -55,7 +67,34 @@ class RagToolService:
             return []
 
         chunks = await self.retriever.read_chunk(chunk_id, window=window)
-        return [chunk for chunk in chunks if chunk.chunk_id in allowed_chunk_ids]
+        scoped = [chunk for chunk in chunks if chunk.chunk_id in allowed_chunk_ids]
+        return self._include_parent_context(scoped)
+
+    @staticmethod
+    def _include_parent_context(chunks: list[RagChunk]) -> list[RagChunk]:
+        """Attach parent section text when child chunks carry parent metadata."""
+        if not chunks:
+            return chunks
+        output: list[RagChunk] = []
+        seen_parent_ids: set[str] = set()
+        for chunk in chunks:
+            metadata = chunk.metadata or {}
+            parent_id = metadata.get("parentChunkId") or metadata.get("parent_chunk_id")
+            parent_text = metadata.get("parentChunkText")
+            if parent_id and parent_text and parent_id not in seen_parent_ids:
+                seen_parent_ids.add(str(parent_id))
+                output.append(
+                    RagChunk(
+                        chunk_id=str(parent_id),
+                        chunk_index=None,
+                        text=str(parent_text),
+                        token_count=chunk.token_count,
+                        metadata={**metadata, "chunkRole": "parent"},
+                        source_file_id=chunk.source_file_id,
+                    )
+                )
+            output.append(chunk)
+        return output
 
     async def list_sources(self, context: RagRequestContext) -> list[dict[str, Any]]:
         """Return request-scoped source descriptors."""

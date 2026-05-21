@@ -162,9 +162,10 @@ class AgentService:
         )
 
         # 构建工具配置
-        # 应用层统一语义：None 和 [] 都表示使用 SDK 默认工具集（完整工具）；
-        # 只有非空列表才表示限制为指定工具。
-        tools = allowed_tools or []
+        # 新版 SDK 语义：[] 表示 Skills / 原生工具全开（推荐显式传 []）。
+        # 请求层 None 会在进入本方法前被上层归一化为 []（与 [] 效果相同）。
+        # 只有非空列表才表示白名单限制。
+        tools = allowed_tools if allowed_tools is not None else []
 
         # 全局安全模式：强制禁用写入/执行类工具，避免在服务器落盘或执行任意命令
         effective_disallowed_tools: list[str] = []
@@ -396,7 +397,7 @@ class AgentService:
             list(effective_mcp_servers.keys()),
         )
 
-        sdk_allowed_tools = allowed_tools or []
+        sdk_allowed_tools = allowed_tools if allowed_tools is not None else []
         logger.info("[ClaudeAgentOptions] sdk_allowed_tools=%s", sdk_allowed_tools)
 
         options = ClaudeAgentOptions(

@@ -1006,7 +1006,23 @@ tenant_id / owner_id / api_key_id matches context
 
 ### 11.4 与现有 `/agent-sdk/stream` 的关系
 
-建议不要直接把 RAG 混进现有 `/agent-sdk/stream`，而是新增 `/rag/stream`。
+建议不要直接把 RAG 混进现有 `/agent-sdk/stream`，而是使用专用 RAG 流式接口：
+
+| 接口 | 定位 | `allowed_tools`（服务端） |
+| --- | --- | --- |
+| `POST /agent-sdk/rag/stream` | **正式前端入口**：RAG + Claude Agent SDK + Skills | `[]`（Skills 全开；RAG 通过 `mcp_servers` 注入） |
+| `POST /rag/stream` | 开发/纯 RAG 问答（仅 RAG MCP 四件套） | `RAG_MCP_ALLOWED_TOOLS` |
+| `POST /rag/agent/stream` | Legacy 诊断入口（同 `/agent-sdk/rag/stream`） | `[]` |
+
+实现说明：上表三个流式接口均调用 `RagAgentRunner.stream_claude_sdk` + `mcp_servers={"rag": ...}`，由路径固定 `allowed_tools`，**不使用** `RAG_AGENT_MODE` 环境变量。
+
+`allowed_tools` 语义（与新版 Claude Agent SDK 一致）：
+
+- **`[]`**：不限制原生工具 / **Skills 全开**（推荐显式写法）。
+- **非空列表**：白名单，仅允许列出的工具（含 `mcp__rag__*` 时需显式列入）。
+- **请求未传 / `null`**：在 `agent_service` 层会归一化为 `[]` 再交给 SDK，效果与 `[]` 相同，但**不应依赖 `null` 表达「全开」**；RAG 正式入口应固定传 `[]`。
+
+另：纯 RAG 调试可用 `/rag/stream`，不要把 RAG 混进 `/agent-sdk/stream` 的普通 `StreamRequest`。
 
 原因：
 
@@ -1511,14 +1527,14 @@ TopK 检索召回率 >= 85%。
 | --- | --- | --- |
 | 上传一个 markdown 文件 | [x] | HTTP `/rag/files` 测试覆盖 markdown 上传。 |
 | 问文件中的事实性问题 | [x] | `_generate_rag_stream` fake agent 测试覆盖基于上传文件问答链路。 |
-| Agent 能正确检索并引用 | [x] | Agent 已可通过 request-scoped MCP tools 自主检索和读取 chunk；RAG MCP tool 对空结果/低相关结果返回结构化提示；MiniMax / Anthropic-compatible direct tool-loop runner 已通过 opt-in 真实 smoke test 验证。 |
+| Agent 能正确检索并引用 | [x] | Agent 已可通过 request-scoped MCP tools 自主检索和读取 chunk；RAG MCP tool 对空结果/低相关结果返回结构化提示；`/rag/stream` 真实 Agent MCP smoke test（`RUN_RAG_AGENT_SMOKE=1`）已验证端到端 tool-use 闭环。 |
 | 流式输出正常 | [x] | SSE `agent_delta` / `result` / `error` 分支已测试；router 不再输出预检索事件。 |
 | 并发请求不会串用其他请求的 fileSet 或 source scope | [x] | `RagToolService` source scope/topK 测试覆盖跨 fileSet 读取拦截。 |
 
 #### Phase 1 剩余缺口
 
-1. 已重跑 `RUN_RAG_AGENT_SMOKE=1 uv run pytest tests/test_rag_smoke.py -q`，结果 `1 passed`；验证 direct tool-loop 会绑定 router 当前 `rag_tool_service`，可在 smoke monkeypatch 的 request-scoped fileSet 中召回 `30 days` 并输出最终 `result`。
-2. Claude Agent SDK in-process MCP 路径在非原生 Claude / Anthropic-compatible 环境仍可能触发 `CLIConnectionError("ProcessTransport is not ready for writing")` / `unhandled errors in a TaskGroup`，当前生产建议优先使用 `RAG_AGENT_MODE=direct` 或 `auto` 下的 direct 路径。
+1. 已重跑 `RUN_RAG_AGENT_SMOKE=1 uv run pytest tests/test_rag_smoke.py -q`，结果 `1 passed`；验证 RAG 工具会绑定 router 当前 `rag_tool_service`，可在 smoke monkeypatch 的 request-scoped fileSet 中召回 `30 days` 并输出最终 `result`。
+2. Claude Agent SDK 已升级，in-process MCP 路径作为 RAG Agent 主路径；不同接口通过固定实现隔离能力边界，不再通过运行模式环境变量切换。
 3. 后续每完成以上缺口，必须同步更新本进度追踪表。
 
 ### Phase 2: 多文件与 Hybrid Search
@@ -1770,9 +1786,9 @@ MVP 优先完成临时 `fileSet` 的端到端能力，避免在外部向量库 p
 
 ### 21.6 RAG Agent 是否必须依赖 Claude Agent SDK MCP？
 
-不必须。
+**对外 HTTP 流式接口：是。** 当前实现中，所有 RAG 流式入口均通过 Claude Agent SDK + request-scoped in-process MCP 完成 tool-use 闭环。
 
-RAG 的核心目标是“模型参与检索决策与证据判断”，而不是绑定某一种工具传输协议。Claude Agent SDK MCP 仍然保留为可选运行模式，适合原生 Claude / Claude Code Agent Runtime 完整可用的环境；但 RAG 专用接口必须提供独立的 direct tool-loop runner，避免把 `/rag/stream`、`/rag/query` 的生产稳定性耦合到 Claude Code CLI subprocess / MCP transport。
+RAG 的核心目标是“模型参与检索决策与证据判断”。工具执行仍落在 `RagToolService`（检索、读 chunk、列来源），只是由 SDK 通过 `mcp_servers={"rag": ...}` 注入，而不是由全局环境变量在多条运行路径之间切换。
 
 推荐拆分为三层：
 
@@ -1780,30 +1796,20 @@ RAG 的核心目标是“模型参与检索决策与证据判断”，而不是�
    - `RagToolService`、`RagRetriever`、`VectorStore`、citation、权限过滤。
    - 只负责确定性检索与证据读取。
 2. **RAG Agent Runner**
-   - 新增独立模块，例如 `app/services/rag/agent_runner.py`。
-   - 负责 RAG 专用 direct Anthropic-compatible tool loop。
-   - 只暴露固定 RAG tools，不接入 Bash / Edit / Write / Skills。
+   - 模块：`app/services/rag/agent_runner.py`。
+   - **路由按接口固定实现**（无 `RAG_AGENT_MODE`）：
+     - `/agent-sdk/rag/stream`、`/rag/agent/stream` → `stream_claude_sdk`，`allowed_tools=[]`（Skills 全开 + RAG MCP）。
+     - `/rag/stream` → `stream_claude_sdk`，`allowed_tools=RAG_MCP_ALLOWED_TOOLS`（仅 RAG 四件套）。
+   - `stream_direct`（Anthropic-compatible `/v1/messages` tool loop）保留在模块内，供测试或后续扩展；**当前 Router 未接入**。
 3. **Claude Agent SDK Adapter**
-   - 保留现有 `app/services/agent.py` 和 `app/services/rag/mcp.py`。
-   - 只作为 `RAG_AGENT_MODE=claude_sdk` 或 `auto` 下的可选路径。
-
-配置建议：
-
-```text
-RAG_AGENT_MODE=auto
-```
-
-可选值：
-
-- `direct`：始终使用 RAG 自有 direct tool loop，推荐 MiniMax / GLM / Anthropic-compatible provider 的生产默认值。
-- `claude_sdk`：始终使用 Claude Agent SDK + in-process MCP，适合原生 Claude Agent Runtime。
-- `auto`：先按 provider 选择默认路径；compatible endpoint 优先 direct，必要时保留 Claude SDK fallback/实验路径。
+   - `app/services/agent.py` + `app/services/rag/mcp.py`。
+   - RAG 能力通过 request-scoped MCP server 注入；`/rag/query` 在非流式场景下同样经 `query_stream` + MCP 生成答案。
 
 架构边界：
 
-- RAG direct runner 禁止修改 `app/services/agent.py` 的通用 Claude Agent 核心。
-- RAG direct runner 只能依赖 `RagToolService` 执行工具，不能绕过 request-scoped source scope。
-- Router 只负责 HTTP/SSE 编排，不应长期承载 tool schema、tool execution、provider loop 等细节。
+- RAG runner 禁止修改 `app/services/agent.py` 的通用 Claude Agent 核心逻辑。
+- 工具执行只能依赖 `RagToolService`，不能绕过 request-scoped source scope。
+- Router 只负责 HTTP/SSE 编排，不应长期承载 tool schema、tool execution 等细节。
 - 最终 citations、usage、toolCalls 应由服务端结构化记录，不完全依赖模型自然语言输出。
 
 ## 22. 最小实现伪流程
@@ -1831,16 +1837,15 @@ FileSet status = ready
 ### 22.2 用户提问
 
 ```text
-用户调用 /rag/stream
+用户调用 /agent-sdk/rag/stream（推荐）或 /rag/stream（纯 RAG 调试）
   ↓
 RagRouter 构造 RagRequestContext
   ↓
-RagAgentRunner.stream
+RagAgentRunner.stream_claude_sdk
   ↓
-根据 RAG_AGENT_MODE 选择运行路径
-  |-- direct: Anthropic-compatible /v1/messages tool loop
-  |-- claude_sdk: Claude Agent SDK + in-process MCP
-  |-- auto: compatible provider 优先 direct，必要时 fallback
+根据接口固定 allowed_tools
+  |-- /agent-sdk/rag/stream、/rag/agent/stream: allowed_tools=[]，Skills 全开 + RAG MCP
+  |-- /rag/stream: allowed_tools=RAG_MCP_ALLOWED_TOOLS，仅 RAG 四件套
   ↓
 模型通过 tool_use 调用 rag_hybrid_search
   ↓
@@ -1853,25 +1858,18 @@ RagToolService 执行检索 / read_chunk 并强制 source scope
 SSE 返回
 ```
 
-### 22.3 Direct Tool Loop 模块边界
-
-建议新增模块：
+### 22.3 Tool 执行模块边界（当前）
 
 ```text
 app/services/rag/
-├── agent_runner.py   # RAG 专用 Agent runner，不依赖 app/services/agent.py
-├── llm_client.py     # Anthropic-compatible /v1/messages client
-├── tool_schema.py    # RAG tool schema，后续可转换为 Anthropic/OpenAI/MCP 格式
-└── tool_executor.py  # tool_use -> RagToolService 调用
+├── agent_runner.py   # stream_claude_sdk（HTTP 流式主路径）；stream_direct 内部保留
+├── mcp.py            # request-scoped MCP server，对接 RagToolService
+├── tool_schema.py    # direct runner 用 Anthropic tool schema（HTTP 未接入）
+├── tool_executor.py  # tool_use -> RagToolService
+└── tools.py          # RagToolService：hybrid_search / read_chunk / ...
 ```
 
-第一轮重构可以先落地：
-
-- `tool_schema.py`：迁移 direct `rag_hybrid_search` / `rag_read_chunk` / `rag_list_sources` / `rag_get_file_outline` schema。
-- `tool_executor.py`：迁移 `_execute_direct_rag_tool`。
-- `agent_runner.py`：迁移 direct `/v1/messages` loop 与 SSE event 生成。
-
-后续再根据需要拆出 `llm_client.py`，避免一次性改动过大。
+HTTP 流式问答统一经 `agent_service.query_stream` + `mcp_servers={"rag": ...}`；`stream_direct` 不经过 Router，仅在模块内保留供测试或后续扩展。
 
 ## 23. 验收标准
 
@@ -1884,7 +1882,7 @@ app/services/rag/
 - 支持 SSE 流式输出。
 - 不影响现有 `/agent-sdk/stream` 行为。
 - RAG 工具通过 Claude Agent SDK MCP 机制接入。
-- RAG direct tool-loop runner 与 Claude Agent SDK 核心模块解耦，MiniMax / Anthropic-compatible provider 可不经过 MCP 完成真实 tool-use 闭环。
+- RAG 流式接口统一经 Claude Agent SDK MCP 完成 tool-use；`stream_direct` 与 SDK 核心解耦但当前未挂到 HTTP 路由。
 - 检索逻辑和 Agent 逻辑解耦。
 - 后续可以替换向量库和 embedding provider。
 - `fileSet` 与 `conversationId` 的绑定规则清晰。
@@ -1910,15 +1908,15 @@ Ingestion Pipeline
 
 Client
   |
-  |  POST /rag/stream
+  |  POST /agent-sdk/rag/stream 或 /rag/stream
   v
 FastAPI RAG Router
   |
   v
-RagAgentRunner
+RagAgentRunner.stream_claude_sdk
   |
-  |-- direct: Anthropic-compatible Messages API tool loop
-  |-- claude_sdk: Claude Agent SDK + in-process MCP Server: rag-tools
+  v
+Claude Agent SDK + in-process MCP Server: rag-tools
   |
   |-- rag_hybrid_search
   |-- rag_keyword_search

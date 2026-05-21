@@ -20,6 +20,8 @@ RagFileStatus = Literal[
 ]
 RagEventMode = Literal["rag", "agent-sdk-compatible"]
 LowConfidenceStrategy = Literal["insufficient_context", "answer_with_warning"]
+RagVerificationMode = Literal["off", "standard", "strict"]
+RagAbstentionMode = Literal["off", "insufficient_context", "require_human"]
 
 
 class RagSource(BaseModel):
@@ -37,9 +39,29 @@ class RagQueryOptions(BaseModel):
     """RAG 问答选项。"""
 
     top_k: int = Field(8, alias="topK", ge=1, le=30, description="检索 TopK")
+    retrieve_top_k: int = Field(
+        100,
+        alias="retrieveTopK",
+        ge=1,
+        le=200,
+        description="多路召回候选池大小",
+    )
+    final_top_k: int | None = Field(
+        None,
+        alias="finalTopK",
+        ge=1,
+        le=30,
+        description="进入回答的最终证据数量；默认兼容 topK",
+    )
     hybrid: bool = Field(True, description="是否启用混合检索")
     rerank: bool = Field(False, description="是否启用 rerank")
+    rerank_provider: str | None = Field(
+        None,
+        alias="rerankProvider",
+        description="Rerank provider，如 local_lexical 或 cross_encoder_http",
+    )
     query_rewrite: bool = Field(True, alias="queryRewrite", description="是否启用本地查询扩展")
+    multi_query: bool = Field(True, alias="multiQuery", description="是否启用多查询召回")
     context_window: int = Field(
         0,
         alias="contextWindow",
@@ -59,12 +81,22 @@ class RagQueryOptions(BaseModel):
         alias="lowConfidenceStrategy",
         description="低置信度回答策略",
     )
+    verification_mode: RagVerificationMode = Field(
+        "standard",
+        alias="verificationMode",
+        description="答案验证强度",
+    )
+    abstention_mode: RagAbstentionMode = Field(
+        "insufficient_context",
+        alias="abstentionMode",
+        description="证据不足时的兜底策略",
+    )
     answer_with_citations: bool = Field(
         True,
         alias="answerWithCitations",
         description="是否要求回答携带引用",
     )
-    max_turns: int = Field(6, alias="maxTurns", ge=1, le=20, description="Agent 最大轮次")
+    max_turns: int = Field(10, alias="maxTurns", ge=1, le=20, description="Agent 最大轮次")
     event_mode: RagEventMode = Field(
         "rag",
         alias="eventMode",

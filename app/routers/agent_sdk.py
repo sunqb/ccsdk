@@ -40,9 +40,9 @@ async def _generate_sse_stream(
     event_mode: str = "full",
 ) -> AsyncGenerator[str, None]:
     """生成 SSE 事件流"""
-    # 应用层统一语义：None 和 [] 都表示使用 SDK 默认工具集（完整工具）；
-    # 如果用户明确传递非空列表（如 ["Skill"]），则只允许这些工具。
-    tools = allowed_tools or []
+    # 新版 SDK 语义：[] 表示 Skills / 原生工具全开；非空列表为白名单限制。
+    # 请求未传时由上层保持 None，进入 agent_service 后归一化为 []。
+    tools = allowed_tools if allowed_tools is not None else []
 
     effective_event_mode = (event_mode or "full").strip().lower()
     if effective_event_mode not in ("full", "text_only"):
@@ -102,7 +102,7 @@ async def agent_sdk_stream(request: StreamRequest):
     - baseURL: 可选，覆盖默认 API URL
     - apiKey: 可选，覆盖默认 API Key
     - options: 透传给 claude-agent-sdk 的选项
-      - allowedTools (默认完整工具集；None 或 [] 均表示默认工具集)
+      - allowedTools：推荐传 `[]` 表示 Skills 全开；非空列表表示白名单；未传则服务端归一化为 `[]`
       - disallowedTools
       - tools
       - maxTurns
@@ -181,6 +181,8 @@ async def agent_sdk_rag_stream(request: RagStreamRequest):
     与 `/agent-sdk/stream` 的区别：
     - 本接口请求模型是 `RagStreamRequest`，包含 fileSetId/knowledgeBaseId/sources/options。
     - 本接口会注入 RAG 上下文，回答可返回 RAG 专用 result 结构。
+    - 服务端固定 `allowed_tools=[]`（Skills 全开），RAG 能力通过 request-scoped `mcp_servers` 注入；
+      **不要**在请求里传 `allowedTools: null` 来表达「全开」，应使用 `[]` 保持语义一致。
 
     与 `/rag/agent/stream` 的区别：
     - 本接口是前端推荐入口。

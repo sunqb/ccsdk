@@ -1,5 +1,9 @@
 """
-RAG API 路由 - MVP 文件上传与索引状态查询。
+RAG API 路由 - 文件上传、索引状态与流式问答。
+
+流式入口与 allowed_tools：
+- POST /agent-sdk/rag/stream（推荐）：服务端 allowed_tools=[]，Skills 全开 + RAG MCP。
+- POST /rag/stream：仅 RAG MCP 四件套（RAG_MCP_ALLOWED_TOOLS）。
 """
 import json
 from collections.abc import AsyncGenerator
@@ -17,7 +21,6 @@ from ..models.rag import (
     KnowledgeBaseListResponse,
     RagAnswer,
     RagFileSetStatusResponse,
-    RagRequestContext,
     RagStreamRequest,
     UploadFileResponse,
 )
@@ -28,8 +31,15 @@ from ..services.rag import (
     RagConcurrencyGuard,
     RagToolExecutor,
     rag_agent_runner,
+    rag_answer_verifier,
     build_provider_info,
+    build_request_context,
+    new_retrieval_trace,
+    structured_abstention_answer,
+    abstention_reason_labels,
+    evaluate_retrieval_cases,
     rag_ingestion_service,
+    rag_retriever,
     rag_tool_service,
 )
 from ..services.rag.mcp import RAG_MCP_ALLOWED_TOOLS, create_rag_mcp_server
@@ -167,8 +177,7 @@ def _active_rag_agent_runner() -> RagAgentRunner:
 
 async def _generate_rag_stream(request: RagStreamRequest) -> AsyncGenerator[str, None]:
     request_id = f"req_{uuid4().hex}"
-    sources = request.get_sources()
-    if not sources:
+    if not request.get_sources():
         yield _sse_event(
             "error",
             {
@@ -179,93 +188,23 @@ async def _generate_rag_stream(request: RagStreamRequest) -> AsyncGenerator[str,
         )
         return
 
-    context = RagRequestContext(
-        requestId=request_id,
-        conversationId=request.conversation_id,
-        sources=sources,
-        activeFileSetId=request.file_set_id,
-        topK=request.options.top_k,
-    )
-
-    base_url = request.base_url or settings.anthropic_base_url
+    context = build_request_context(request, request_id=request_id)
     active_runner = _active_rag_agent_runner()
-    if active_runner.should_use_direct(base_url=base_url):
-        async for direct_event in active_runner.stream_direct(
-            request=request,
-            context=context,
-            request_id=request_id,
-            system_prompt=RAG_SYSTEM_PROMPT,
-        ):
-            yield direct_event
-        return
-
-    try:
-        rag_mcp_server = create_rag_mcp_server(context, tool_service=rag_tool_service)
-        answer_parts: list[str] = []
-        async for event in agent_service.query_stream(
-            prompt=request.message,
-            conversation_id=request.conversation_id,
-            allowed_tools=RAG_MCP_ALLOWED_TOOLS,
-            max_turns=request.options.max_turns,
-            system_prompt=RAG_SYSTEM_PROMPT,
-            cwd=request.cwd,
-            model=request.model,
-            base_url=request.base_url,
-            api_key=request.api_key,
-            result_mode="full",
-            mcp_servers={"rag": rag_mcp_server},
-        ):
-            text = _extract_agent_delta(event)
-            if text:
-                answer_parts.append(text)
-                yield _sse_event("agent_delta", {"text": text, "requestId": request_id})
-            elif event.type == "error":
-                if active_runner.should_fallback_to_direct(event.data, base_url=base_url):
-                    async for fallback_event in active_runner.stream_direct(
-                        request=request,
-                        context=context,
-                        request_id=request_id,
-                        system_prompt=RAG_SYSTEM_PROMPT,
-                        reason=str(event.data),
-                    ):
-                        yield fallback_event
-                    return
-                yield _sse_event(
-                    "error",
-                    {"code": "agent_error", "message": event.data, "requestId": request_id},
-                )
-                return
-
-        yield _sse_event(
-            "result",
-            {
-                "answer": "".join(answer_parts),
-                "citations": [],
-                "requestId": request_id,
-            },
-        )
-    except Exception as exc:  # noqa: BLE001 - convert stream failures to SSE errors
-        if active_runner.should_fallback_to_direct(str(exc), base_url=base_url):
-            async for fallback_event in active_runner.stream_direct(
-                request=request,
-                context=context,
-                request_id=request_id,
-                system_prompt=RAG_SYSTEM_PROMPT,
-                reason=str(exc),
-            ):
-                yield fallback_event
-            return
-        yield _sse_event(
-            "error",
-            {"code": "rag_stream_error", "message": str(exc), "requestId": request_id},
-        )
+    async for event in active_runner.stream_claude_sdk(
+        request=request,
+        context=context,
+        request_id=request_id,
+        system_prompt=RAG_SYSTEM_PROMPT,
+        allowed_tools=RAG_MCP_ALLOWED_TOOLS,
+        cwd=request.cwd,
+    ):
+        yield event
 
 
 async def _generate_rag_agent_stream(request: RagStreamRequest) -> AsyncGenerator[str, None]:
-    """Expose request-scoped RAG tools and let Claude Agent SDK decide when to call them."""
+    """Claude Agent SDK primary path: RAG MCP + native Skills (allowed_tools=[] 表示 Skills 全开)."""
     request_id = f"req_{uuid4().hex}"
-    sources = request.get_sources()
-    if not sources:
+    if not request.get_sources():
         yield _sse_event(
             "error",
             {
@@ -276,80 +215,20 @@ async def _generate_rag_agent_stream(request: RagStreamRequest) -> AsyncGenerato
         )
         return
 
-    context = RagRequestContext(
-        requestId=request_id,
-        conversationId=request.conversation_id,
-        sources=sources,
-        activeFileSetId=request.file_set_id,
-        topK=request.options.top_k,
-    )
-
+    context = build_request_context(request, request_id=request_id)
+    active_runner = _active_rag_agent_runner()
     try:
-        rag_mcp_server = create_rag_mcp_server(context, tool_service=rag_tool_service)
-        answer_parts: list[str] = []
-        async for event in agent_service.query_stream(
-            prompt=request.message,
-            conversation_id=request.conversation_id,
-            # Do not restrict this endpoint to RAG MCP tools only. It is meant to
-            # combine request-scoped RAG tools with native Claude Code capabilities
-            # such as reading project skills from .claude/skills.
-            allowed_tools=None,
-            max_turns=request.options.max_turns,
+        async for event in active_runner.stream_claude_sdk(
+            request=request,
+            context=context,
+            request_id=request_id,
             system_prompt=RAG_AGENT_TOOL_SYSTEM_PROMPT,
+            allowed_tools=[],
             cwd=request.cwd or settings.work_dir,
-            model=request.model,
-            base_url=request.base_url,
-            api_key=request.api_key,
-            result_mode="full",
-            mcp_servers={"rag": rag_mcp_server},
         ):
-            text = _extract_agent_delta(event)
-            if text:
-                answer_parts.append(text)
-                yield _sse_event("agent_delta", {"text": text, "requestId": request_id})
-            elif event.type == "error":
-                event_data = event.data if isinstance(event.data, dict) else {}
-                if event_data.get("code") == "sdk_control_channel_close_race":
-                    yield _sse_event(
-                        "error",
-                        {
-                            "code": "agent_sdk_control_channel_close_race",
-                            "message": "Claude Agent SDK MCP control channel closed before native Skills could be inspected. Retry with a new conversationId or disable SDK MCP fallback for this request.",
-                            "requestId": request_id,
-                            "recoverable": True,
-                            "detail": event.data,
-                        },
-                    )
-                    return
-
-                yield _sse_event(
-                    "error",
-                    {"code": "agent_error", "message": event.data, "requestId": request_id},
-                )
-                return
-
-        answer = "".join(answer_parts)
-        yield _sse_event(
-            "result",
-            {
-                "answer": answer,
-                "citations": [],
-                "requestId": request_id,
-                "mode": "agent_tool",
-                "usage": {
-                    "mode": "agent_tool",
-                    "topK": request.options.top_k,
-                    "agent": {"outputChars": len(answer)},
-                },
-            },
-        )
+            yield event
     except RuntimeError as exc:
         yield _sse_event("error", {"code": "rate_limited", "message": str(exc), "requestId": request_id})
-    except Exception as exc:  # noqa: BLE001 - convert stream failures to SSE errors
-        yield _sse_event(
-            "error",
-            {"code": "rag_agent_stream_error", "message": str(exc), "requestId": request_id},
-        )
 
 
 @router.post("/files", dependencies=[Depends(verify_api_key)])
@@ -489,6 +368,31 @@ async def get_rag_admin_stats() -> dict[str, Any]:
     return rag_ingestion_service.get_stats()
 
 
+@router.post("/admin/evaluate", dependencies=[Depends(verify_api_key)])
+async def evaluate_rag_retrieval(
+    file_set_id: str = Query(..., alias="fileSetId"),
+) -> dict[str, Any]:
+    """
+    【开发/运维诊断】对指定 fileSet 运行本地检索评测并返回 hit rate 与 trace。
+    """
+    sources = [{"type": "file_set", "id": file_set_id}]
+    return await evaluate_retrieval_cases(
+        rag_retriever,
+        cases=[
+            {
+                "id": "file_set_probe",
+                "query": "refund payment policy",
+            }
+        ],
+        sources=sources,
+        retrieve_top_k=settings.rag_retrieve_top_k,
+        final_top_k=settings.rag_final_top_k,
+        query_rewrite=True,
+        multi_query=settings.rag_enable_multi_query,
+        rerank=True,
+    )
+
+
 @router.post("/admin/cleanup", dependencies=[Depends(verify_api_key)])
 async def cleanup_rag_file_sets() -> dict[str, int]:
     """
@@ -558,45 +462,57 @@ async def rag_query(request: RagStreamRequest) -> RagAnswer:
             },
         )
 
-    context = RagRequestContext(
-        requestId=request_id,
-        conversationId=request.conversation_id,
-        sources=sources,
-        activeFileSetId=request.file_set_id,
-        topK=request.options.top_k,
-    )
+    context = build_request_context(request, request_id=request_id)
+    final_top_k = context.top_k
     try:
         async with rag_query_guard.slot():
+            trace = new_retrieval_trace(request)
             results = await rag_tool_service.hybrid_search(
                 query=request.message,
                 context=context,
-                top_k=request.options.top_k,
+                top_k=final_top_k,
+                retrieve_top_k=request.options.retrieve_top_k,
+                final_top_k=final_top_k,
+                hybrid=request.options.hybrid,
                 query_rewrite=request.options.query_rewrite,
+                multi_query=request.options.multi_query,
                 rerank=request.options.rerank,
+                rerank_provider=request.options.rerank_provider,
                 context_window=request.options.context_window,
+                trace=trace,
             )
     except RuntimeError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     citations = rag_tool_service.build_citations(results)
-    confidence = rag_tool_service.retriever.assess_confidence(request.message, results)
+    evidence_verification = rag_answer_verifier.assess_evidence(request.message, results)
+    confidence = evidence_verification.confidence
     usage = {
         "requestId": request_id,
         "retrieval": {
-            "topK": request.options.top_k,
+            "retrieveTopK": request.options.retrieve_top_k,
+            "finalTopK": final_top_k,
             "matchedChunks": len(results),
             "confidence": confidence,
             "queryRewrite": request.options.query_rewrite,
+            "multiQuery": request.options.multi_query,
             "rerank": request.options.rerank,
+            "rerankProvider": request.options.rerank_provider or settings.rag_rerank_provider,
             "contextWindow": request.options.context_window,
             "provider": settings.rag_vector_provider,
+            "trace": trace.model_dump(),
         },
+        "verification": evidence_verification.model_dump(),
     }
     if not results or (
         confidence < request.options.min_confidence
         and request.options.low_confidence_strategy == "insufficient_context"
+    ) or (
+        request.options.abstention_mode != "off"
+        and evidence_verification.status != "ok"
+        and request.options.verification_mode == "strict"
     ):
         return RagAnswer(
-            answer=INSUFFICIENT_CONTEXT_ANSWER,
+            answer=structured_abstention_answer(abstention_reason_labels(evidence_verification.reasons)),
             citations=citations if results else [],
             conversationId=request.conversation_id,
             usage=usage,
@@ -642,9 +558,31 @@ async def rag_query(request: RagStreamRequest) -> RagAnswer:
             },
         ) from exc
 
+    answer = "".join(answer_parts)
+    final_verification = rag_answer_verifier.verify_answer(
+        query=request.message,
+        answer=answer,
+        citations=citations,
+        results=results,
+        min_alignment=settings.rag_min_citation_alignment,
+    )
+    usage["verification"] = final_verification.model_dump()
+    if (
+        request.options.abstention_mode != "off"
+        and request.options.verification_mode != "off"
+        and final_verification.status != "ok"
+        and final_verification.citation_alignment_score < settings.rag_min_citation_alignment
+    ):
+        return RagAnswer(
+            answer=structured_abstention_answer(abstention_reason_labels(final_verification.reasons)),
+            citations=citations,
+            conversationId=request.conversation_id,
+            usage=usage,
+        )
+
     return RagAnswer(
-        answer="".join(answer_parts),
+        answer=answer,
         citations=citations,
         conversationId=request.conversation_id,
-        usage={**usage, "agent": {"outputChars": len("".join(answer_parts))}},
+        usage={**usage, "agent": {"outputChars": len(answer)}},
     )

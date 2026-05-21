@@ -41,12 +41,37 @@ class RagToolExecutor:
     ) -> Any:
         """Execute one RAG tool call and return JSON-serializable output."""
         if name == "rag_hybrid_search":
+            permissions = context.permissions or {}
             top_k = tool_input.get("top_k")
             bounded_top_k = int(top_k) if isinstance(top_k, int | float) else context.top_k
+            retrieve_top_k = tool_input.get("retrieve_top_k")
+            final_top_k = tool_input.get("final_top_k")
             results = await self.tool_service.hybrid_search(
                 query=str(tool_input.get("query") or ""),
                 context=context,
                 top_k=bounded_top_k,
+                retrieve_top_k=(
+                    int(retrieve_top_k)
+                    if isinstance(retrieve_top_k, int | float)
+                    else permissions.get("retrieveTopK")
+                ),
+                final_top_k=(
+                    int(final_top_k)
+                    if isinstance(final_top_k, int | float)
+                    else permissions.get("finalTopK")
+                ),
+                query_rewrite=bool(tool_input.get("query_rewrite", permissions.get("queryRewrite", True))),
+                multi_query=bool(tool_input.get("multi_query", permissions.get("multiQuery", True))),
+                rerank=bool(tool_input.get("rerank", permissions.get("rerank", False))),
+                rerank_provider=(
+                    str(tool_input.get("rerank_provider"))
+                    if tool_input.get("rerank_provider") is not None
+                    else permissions.get("rerankProvider")
+                ),
+                context_window=max(
+                    0,
+                    int(tool_input.get("context_window", permissions.get("contextWindow", 0)) or 0),
+                ),
             )
             return search_result_payload(results)
 

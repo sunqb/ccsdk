@@ -1,12 +1,16 @@
 """RAG retrieval service for the MVP."""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
+from ...config import settings
 from ...models.rag import RagCitation, RagRequestContext, RagSource
+from .answer_verifier import rag_answer_verifier
 from .chunker import RagChunk
 from .embeddings import EmbeddingProvider, LocalHashEmbeddingProvider
 from .ingestion import rag_ingestion_service
+from .reranker import build_reranker
 from .vector_store import LocalVectorStore, SearchResult, TOKEN_RE
 
 QUERY_EXPANSIONS = {
@@ -19,6 +23,29 @@ QUERY_EXPANSIONS = {
     "退款": ["退货", "返款", "退款政策"],
     "付款": ["支付", "账期", "发票"],
 }
+
+
+@dataclass(slots=True)
+class RetrievalTrace:
+    """Trace one retrieval request for tuning and observability."""
+
+    query: str
+    variants: list[str]
+    retrieve_top_k: int
+    final_top_k: int
+    stages: list[dict[str, Any]] = field(default_factory=list)
+
+    def add(self, stage: str, **payload: Any) -> None:
+        self.stages.append({"stage": stage, **payload})
+
+    def model_dump(self) -> dict[str, Any]:
+        return {
+            "query": self.query,
+            "variants": self.variants,
+            "retrieveTopK": self.retrieve_top_k,
+            "finalTopK": self.final_top_k,
+            "stages": self.stages,
+        }
 
 
 class RagRetriever:
@@ -39,18 +66,30 @@ class RagRetriever:
         *,
         sources: list[RagSource | dict[str, Any]] | None = None,
         top_k: int = 8,
+        retrieve_top_k: int | None = None,
+        final_top_k: int | None = None,
+        hybrid: bool = True,
         query_rewrite: bool = False,
+        multi_query: bool = False,
         rerank: bool = False,
+        rerank_provider: str | None = None,
         context_window: int = 0,
+        trace: RetrievalTrace | None = None,
     ) -> list[SearchResult]:
         """Search indexed chunks with hybrid vector and keyword retrieval."""
         return await self.hybrid_search(
             query,
             sources=sources,
             top_k=top_k,
+            retrieve_top_k=retrieve_top_k,
+            final_top_k=final_top_k,
+            hybrid=hybrid,
             query_rewrite=query_rewrite,
+            multi_query=multi_query,
             rerank=rerank,
+            rerank_provider=rerank_provider,
             context_window=context_window,
+            trace=trace,
         )
 
     async def hybrid_search(
@@ -59,36 +98,78 @@ class RagRetriever:
         *,
         sources: list[RagSource | dict[str, Any]] | None = None,
         top_k: int = 8,
+        retrieve_top_k: int | None = None,
+        final_top_k: int | None = None,
+        hybrid: bool = True,
         query_rewrite: bool = False,
+        multi_query: bool = False,
         rerank: bool = False,
+        rerank_provider: str | None = None,
         context_window: int = 0,
+        trace: RetrievalTrace | None = None,
     ) -> list[SearchResult]:
         """Combine vector and keyword search results with deduplication."""
-        if top_k <= 0:
+        final_k = final_top_k or top_k
+        if final_k <= 0:
             return []
 
-        candidate_k = max(top_k * 2, top_k)
+        candidate_k = max(retrieve_top_k or settings.rag_retrieve_top_k, final_k)
+        variants = self.build_query_variants(
+            query,
+            query_rewrite=query_rewrite,
+            multi_query=multi_query,
+        )
+        if trace is not None:
+            trace.variants[:] = variants
+            trace.retrieve_top_k = candidate_k
+            trace.final_top_k = final_k
         vector_results: list[SearchResult] = []
         keyword_results: list[SearchResult] = []
-        for variant in self.rewrite_query(query) if query_rewrite else [query]:
+        for variant in variants:
             query_embedding = await self.embedder.embed_query(variant)
+            current_vector_results = await self.vector_store.vector_search(
+                query_embedding=query_embedding,
+                sources=sources,
+                top_k=candidate_k,
+            )
             vector_results.extend(
-                await self.vector_store.vector_search(
-                    query_embedding=query_embedding,
-                    sources=sources,
-                    top_k=candidate_k,
+                self._with_trace_metadata(
+                    current_vector_results,
+                    query_variant=variant,
+                    route="vector",
                 )
             )
-            keyword_results.extend(
-                await self.vector_store.keyword_search(
+            if hybrid:
+                current_keyword_results = await self.vector_store.keyword_search(
                     query=variant,
                     sources=sources,
                     top_k=candidate_k,
                 )
-            )
+                keyword_results.extend(
+                    self._with_trace_metadata(
+                        current_keyword_results,
+                        query_variant=variant,
+                        route="keyword",
+                    )
+                )
+            if trace is not None:
+                trace.add(
+                    "variant_retrieval",
+                    queryVariant=variant,
+                    vectorResults=len(current_vector_results),
+                    keywordResults=len(current_keyword_results) if hybrid else 0,
+                )
         results = self._merge_results(vector_results, keyword_results, top_k=candidate_k)
+        if trace is not None:
+            trace.add("merge", candidates=len(results))
         if rerank:
-            results = self.rerank_results(query, results)
+            results = await build_reranker(rerank_provider).rerank(
+                query=query,
+                results=results,
+                top_k=candidate_k,
+            )
+            if trace is not None:
+                trace.add("rerank", provider=rerank_provider or settings.rag_rerank_provider)
         if context_window > 0:
             results = await self.expand_results_with_context(
                 results,
@@ -96,7 +177,22 @@ class RagRetriever:
                 window=context_window,
                 top_k=candidate_k,
             )
-        return results[:top_k]
+            if trace is not None:
+                trace.add("context_expansion", window=context_window, candidates=len(results))
+        results = results[:final_k]
+        if trace is not None:
+            trace.add(
+                "final",
+                results=[
+                    {
+                        "chunkId": result.chunk_id,
+                        "score": result.score,
+                        "searchType": result.search_type,
+                    }
+                    for result in results
+                ],
+            )
+        return results
 
     async def search_with_context(
         self,
@@ -162,6 +258,25 @@ class RagRetriever:
         return list(dict.fromkeys(variants))
 
     @classmethod
+    def build_query_variants(
+        cls,
+        query: str,
+        *,
+        query_rewrite: bool,
+        multi_query: bool,
+    ) -> list[str]:
+        """Build deterministic multi-query variants for broad recall."""
+        variants = cls.rewrite_query(query) if query_rewrite else [query.strip()]
+        normalized = query.strip()
+        tokens = cls._tokenize(normalized)
+        if multi_query and tokens:
+            variants.append(" ".join(tokens))
+            variants.extend(tokens[:5])
+            if len(tokens) > 2:
+                variants.append(" ".join(tokens[: max(2, len(tokens) // 2)]))
+        return [variant for variant in dict.fromkeys(variant.strip() for variant in variants) if variant]
+
+    @classmethod
     def rerank_results(cls, query: str, results: list[SearchResult]) -> list[SearchResult]:
         """Apply a lightweight lexical reranker over retrieved chunks."""
         query_tokens = set(cls._tokenize(query))
@@ -202,17 +317,7 @@ class RagRetriever:
     @classmethod
     def assess_confidence(cls, query: str, results: list[SearchResult]) -> float:
         """Estimate whether retrieved evidence is strong enough to answer."""
-        if not results:
-            return 0.0
-        query_tokens = set(cls._tokenize(query))
-        if not query_tokens:
-            return 0.0
-        top = results[0]
-        top_tokens = set(cls._tokenize(top.text))
-        overlap = len(query_tokens & top_tokens) / max(1, len(query_tokens))
-        score_component = max(0.0, min(1.0, top.score))
-        support_component = min(1.0, len(results) / 3)
-        return max(0.0, min(1.0, 0.55 * overlap + 0.35 * score_component + 0.10 * support_component))
+        return rag_answer_verifier.retrieval_confidence(query, results)
 
     @classmethod
     def evaluate_retrieval(
@@ -366,6 +471,36 @@ class RagRetriever:
 
         output.sort(key=lambda item: item.score, reverse=True)
         return output[:top_k]
+
+    @staticmethod
+    def _with_trace_metadata(
+        results: list[SearchResult],
+        *,
+        query_variant: str,
+        route: str,
+    ) -> list[SearchResult]:
+        traced: list[SearchResult] = []
+        for result in results:
+            metadata = {
+                **(result.metadata or {}),
+                "retrievalTrace": [
+                    *((result.metadata or {}).get("retrievalTrace") or []),
+                    {"route": route, "queryVariant": query_variant},
+                ],
+            }
+            traced.append(
+                SearchResult(
+                    chunk_id=result.chunk_id,
+                    source_file_id=result.source_file_id,
+                    chunk_index=result.chunk_index,
+                    text=result.text,
+                    score=result.score,
+                    metadata=metadata,
+                    chunk=result.chunk,
+                    search_type=result.search_type,
+                )
+            )
+        return traced
 
 
 rag_retriever = RagRetriever()

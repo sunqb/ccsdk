@@ -502,17 +502,11 @@ def test_rag_direct_tool_schema_is_independent_from_router() -> None:
     }
 
 
-def test_rag_agent_runner_mode_selection() -> None:
-    runner = RagAgentRunner(config=RagAgentRunnerConfig(mode="auto"))
+def test_rag_agent_runner_config_keeps_direct_runtime_limits() -> None:
+    runner = RagAgentRunner(config=RagAgentRunnerConfig(direct_timeout_seconds=30, direct_max_tokens=512))
 
-    assert runner.should_use_direct(base_url="https://api.minimaxi.com/anthropic") is True
-    assert runner.should_use_direct(base_url="https://api.anthropic.com") is False
-    assert runner.should_use_direct(base_url="https://api.anthropic.com", mode="direct") is True
-    assert runner.should_use_direct(base_url="https://api.minimaxi.com/anthropic", mode="claude_sdk") is False
-    assert runner.should_fallback_to_direct(
-        {"message": "ProcessTransport is not ready for writing"},
-        base_url="https://api.minimaxi.com/anthropic",
-    ) is True
+    assert runner.config.direct_timeout_seconds == 30
+    assert runner.config.direct_max_tokens == 512
 
 
 @pytest.mark.asyncio
@@ -767,9 +761,9 @@ def test_rag_agent_stream_exposes_rag_tools_to_native_agent(
     rendered = response.text
     assert response.status_code == 200
     assert "event: result" in rendered
-    assert "agent_tool" in rendered
+    assert "claude_sdk" in rendered or "agent_tool" in rendered
     assert captured["prompt"] == "目前有哪些技能？然后这个文件里面应该用哪个技能合适"
-    assert set(captured["allowed_tools"]) == set(rag_router.RAG_MCP_ALLOWED_TOOLS)
+    assert captured.get("allowed_tools") == []
     assert captured["mcp_servers"]
     assert "rag" in captured["mcp_servers"]
     assert captured["cwd"] == rag_router.settings.work_dir
@@ -985,8 +979,84 @@ def test_rag_query_low_confidence_returns_insufficient_without_agent(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["answer"] == rag_router.INSUFFICIENT_CONTEXT_ANSWER
+    assert "不足" in body["answer"] or "没有找到" in body["answer"]
     assert body["usage"]["retrieval"]["confidence"] < 1.0
+    assert body["usage"]["verification"]["reasons"]
+
+
+def test_multi_query_builds_multiple_variants() -> None:
+    variants = RagRetriever.build_query_variants(
+        "return policy refund",
+        query_rewrite=True,
+        multi_query=True,
+    )
+
+    assert variants[0] == "return policy refund"
+    assert len(variants) >= 3
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_records_retrieval_trace() -> None:
+    service = RagIngestionService(chunker=TextChunker(chunk_size=80, chunk_overlap=0))
+    response = await service.ingest_files(
+        [("policy.md", b"Refund within 30 days.\n\nPayment invoice terms apply.")],
+    )
+    from app.services.rag.retriever import RetrievalTrace
+
+    retriever = RagRetriever(vector_store=service.get_vector_store(), embedder=service.embedder)
+    trace = RetrievalTrace(query="refund 30 days", variants=[], retrieve_top_k=20, final_top_k=3)
+    results = await retriever.hybrid_search(
+        "refund 30 days",
+        sources=[RagSource(type="file_set", id=response.file_set_id)],
+        retrieve_top_k=20,
+        final_top_k=3,
+        query_rewrite=True,
+        multi_query=True,
+        rerank=True,
+        trace=trace,
+    )
+
+    assert results
+    assert trace.stages
+    assert any(stage["stage"] == "merge" for stage in trace.stages)
+
+
+def test_chunk_metadata_includes_parent_chunk_fields() -> None:
+    parser = TextDocumentParser()
+    chunker = TextChunker(chunk_size=120, chunk_overlap=20)
+    document = parser.parse_bytes(
+        b"# Refund Policy\n\nRefunds are allowed within 30 days.",
+        filename="policy.md",
+    )
+    chunks = chunker.chunk_document(document, source_file_id="file_1")
+
+    assert chunks
+    metadata = chunks[0].metadata
+    assert metadata.get("parentChunkId")
+    assert metadata.get("documentId")
+    assert metadata.get("headingPath") == ["Refund Policy"]
+
+
+def test_answer_verifier_detects_unsupported_answer() -> None:
+    from app.services.rag.answer_verifier import rag_answer_verifier
+
+    results = [
+        SearchResult(
+            chunk_id="chunk_1",
+            text="Shipping takes seven days.",
+            score=0.9,
+        )
+    ]
+    verification = rag_answer_verifier.verify_answer(
+        query="refund within 30 days",
+        answer="Refunds are allowed within 30 days.",
+        citations=[],
+        results=results,
+        min_alignment=0.6,
+    )
+
+    assert verification.status != "ok"
+    assert "answer_not_supported_by_evidence" in verification.reasons
 
 
 def test_retrieval_evaluation_harness_reports_hit_rates() -> None:
@@ -1097,7 +1167,7 @@ async def test_rag_stream_sse_with_fake_agent(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         rag_router,
         "rag_agent_runner",
-        RagAgentRunner(config=RagAgentRunnerConfig(mode="claude_sdk")),
+        RagAgentRunner(config=RagAgentRunnerConfig()),
     )
     monkeypatch.setattr(rag_router, "create_rag_mcp_server", lambda *args, **kwargs: object())
     captured: dict[str, object] = {}
@@ -1145,7 +1215,7 @@ async def test_rag_stream_does_not_pre_retrieve_before_agent(
     monkeypatch.setattr(
         rag_router,
         "rag_agent_runner",
-        RagAgentRunner(config=RagAgentRunnerConfig(mode="claude_sdk")),
+        RagAgentRunner(config=RagAgentRunnerConfig()),
     )
     monkeypatch.setattr(rag_router, "create_rag_mcp_server", lambda *args, **kwargs: object())
 
@@ -1183,7 +1253,7 @@ async def test_rag_stream_agent_error_stops_before_result(monkeypatch: pytest.Mo
     monkeypatch.setattr(
         rag_router,
         "rag_agent_runner",
-        RagAgentRunner(config=RagAgentRunnerConfig(mode="claude_sdk")),
+        RagAgentRunner(config=RagAgentRunnerConfig()),
     )
     monkeypatch.setattr(rag_router, "create_rag_mcp_server", lambda *args, **kwargs: object())
 

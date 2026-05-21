@@ -97,13 +97,50 @@ def create_rag_mcp_server(
     @tool(
         "rag_hybrid_search",
         "Search request-scoped RAG sources and return citation-ready chunks.",
-        {"query": str, "top_k": int},
+        {
+            "query": str,
+            "top_k": int,
+            "retrieve_top_k": int,
+            "final_top_k": int,
+            "query_rewrite": bool,
+            "multi_query": bool,
+            "rerank": bool,
+            "context_window": int,
+        },
     )
     async def rag_hybrid_search(args: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
         query = str(args.get("query") or "")
         top_k = args.get("top_k")
         bounded_top_k = int(top_k) if isinstance(top_k, int | float) else context.top_k
-        results = await service.hybrid_search(query=query, context=context, top_k=bounded_top_k)
+        permissions = context.permissions or {}
+        results = await service.hybrid_search(
+            query=query,
+            context=context,
+            top_k=bounded_top_k,
+            retrieve_top_k=(
+                int(args["retrieve_top_k"])
+                if isinstance(args.get("retrieve_top_k"), int | float)
+                else permissions.get("retrieveTopK")
+            ),
+            final_top_k=(
+                int(args["final_top_k"])
+                if isinstance(args.get("final_top_k"), int | float)
+                else permissions.get("finalTopK")
+            ),
+            hybrid=bool(permissions.get("hybrid", True)),
+            query_rewrite=bool(args.get("query_rewrite", permissions.get("queryRewrite", True))),
+            multi_query=bool(args.get("multi_query", permissions.get("multiQuery", True))),
+            rerank=bool(args.get("rerank", permissions.get("rerank", False))),
+            rerank_provider=(
+                str(args.get("rerank_provider"))
+                if args.get("rerank_provider") is not None
+                else permissions.get("rerankProvider")
+            ),
+            context_window=max(
+                0,
+                int(args.get("context_window", permissions.get("contextWindow", 0)) or 0),
+            ),
+        )
         return _tool_text(build_rag_search_response(query, results))
 
     @tool(

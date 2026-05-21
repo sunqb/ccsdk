@@ -135,9 +135,6 @@ class Settings:
     rag_vector_provider: str = field(
         default_factory=lambda: os.getenv("RAG_VECTOR_PROVIDER", "local")
     )
-    rag_agent_mode: str = field(
-        default_factory=lambda: os.getenv("RAG_AGENT_MODE", "auto").strip().lower()
-    )
     rag_direct_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("RAG_DIRECT_TIMEOUT_SECONDS", "120"))
     )
@@ -161,6 +158,27 @@ class Settings:
     )
     rag_max_top_k: int = field(
         default_factory=lambda: int(os.getenv("RAG_MAX_TOP_K", "30"))
+    )
+    rag_retrieve_top_k: int = field(
+        default_factory=lambda: int(os.getenv("RAG_RETRIEVE_TOP_K", "100"))
+    )
+    rag_final_top_k: int = field(
+        default_factory=lambda: int(os.getenv("RAG_FINAL_TOP_K", "8"))
+    )
+    rag_enable_multi_query: bool = field(
+        default_factory=lambda: _env_bool("RAG_ENABLE_MULTI_QUERY", "true")
+    )
+    rag_rerank_provider: str = field(
+        default_factory=lambda: os.getenv("RAG_RERANK_PROVIDER", "local_lexical")
+    )
+    rag_rerank_base_url: str | None = field(
+        default_factory=lambda: os.getenv("RAG_RERANK_BASE_URL")
+    )
+    rag_verification_mode: str = field(
+        default_factory=lambda: os.getenv("RAG_VERIFICATION_MODE", "standard").strip().lower()
+    )
+    rag_min_citation_alignment: float = field(
+        default_factory=lambda: float(os.getenv("RAG_MIN_CITATION_ALIGNMENT", "0.6"))
     )
     rag_chunk_size: int = field(
         default_factory=lambda: int(os.getenv("RAG_CHUNK_SIZE", "1000"))

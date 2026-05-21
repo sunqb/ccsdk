@@ -24,7 +24,7 @@ class AgentSDKOptions(BaseModel):
     allowed_tools: Optional[list[str]] = Field(
         None,
         alias="allowedTools",
-        description="允许使用的工具列表；None 或 [] 表示 SDK 默认完整工具集，非空列表表示限制工具"
+        description="允许使用的工具列表；推荐 [] 表示 Skills/原生工具全开；非空列表为白名单；未传则服务端归一化为 []"
     )
     disallowed_tools: Optional[list[str]] = Field(
         None,

@@ -186,7 +186,7 @@ curl -X POST http://localhost:8000/agent-sdk/stream \
   "resultMode": "full",
   "eventMode": "full",
   "options": {
-    "allowedTools": null,
+    "allowedTools": [],
     "maxTurns": 10
   }
 }
@@ -340,7 +340,7 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 
 1) 在 **Claude Code 可加载的 settings** 里配置 `mcpServers`（推荐放在项目下，随 `cwd` 生效）  
 2) 确保请求的 `settingSources` 覆盖到你放置 settings 的来源（`project/user/local`）  
-3) 不要把 `options.allowedTools` 限制到排除 MCP（或把对应 `mcp__<server>__<tool>` 加进去）
+3) `options.allowedTools` 语义：推荐传 `[]` 表示 Skills 全开；非空列表为白名单。不要把白名单写窄到误排除 MCP（若需限制，应显式包含 `mcp__<server>__<tool>`）
 
 **示例：在 `./.claude/settings.json` 配置一个 stdio MCP server（以“搜索类 server”为例，command/args 请以该 server 文档为准）**
 ```json
@@ -457,11 +457,11 @@ def to_sse(self) -> str:
 
 ### 4. 默认工具配置
 
-使用 SDK 默认工具集，不限制为 `["Skill"]`：
+使用 SDK 默认工具集（Skills 全开），推荐显式传 `[]`，不要限制为 `["Skill"]`：
 
 ```python
 # agent_sdk.py
-tools = allowed_tools if allowed_tools is not None else None
+tools = allowed_tools if allowed_tools is not None else []
 ```
 
 ### 5. 设置加载
@@ -624,9 +624,33 @@ black app/
 ruff check app/
 ```
 
+### RAG 流式接口与 `allowedTools`
+
+RAG 流式问答**统一走 Claude Agent SDK + request-scoped in-process MCP**，由**接口路径**决定能力边界，**不再**通过 `RAG_AGENT_MODE` 等环境变量切换运行模式。
+
+| 接口 | 用途 | 实现路径 | 服务端 `allowed_tools` |
+|------|------|----------|------------------------|
+| `POST /agent-sdk/rag/stream` | **推荐**：上传文件/知识库问答 + Skills | `RagAgentRunner.stream_claude_sdk` | `[]`（Skills 全开；RAG 经 `mcp_servers` 注入） |
+| `POST /rag/agent/stream` | Legacy / 诊断（与上一行等价） | 同上 | `[]` |
+| `POST /rag/stream` | 纯 RAG 调试（无 Skills 编排） | `stream_claude_sdk` | 仅 `rag_hybrid_search` 等四个 MCP 工具 |
+| `POST /rag/query` | 非流式问答 | 服务端预检索 + `agent_service.query_stream` + MCP | 四个 RAG MCP 工具 |
+
+说明：
+
+- `app/services/rag/agent_runner.py` 中的 `stream_direct`（Anthropic-compatible `/v1/messages` tool loop）为**内部保留实现**，当前 **HTTP 路由未接入**；流式生产/调试入口均使用 `stream_claude_sdk`。
+- `RAG_DIRECT_TIMEOUT_SECONDS` / `RAG_DIRECT_MAX_TOKENS` 仅在与 `stream_direct` 相关的测试或后续扩展时使用，不影响上述流式接口。
+
+**`allowedTools` 语义（新版 Claude Agent SDK）**
+
+- `[]`：Skills / 原生工具全开（**推荐显式传 `[]`**，不要依赖 `null`）。
+- 非空数组：白名单，仅允许列出的工具。
+- 未传 / `null`：进入服务后会归一化为 `[]`，效果与 `[]` 相同，但语义不清晰。
+
+详细设计见 [docs/specs/rag-knowledge-qa.md](docs/specs/rag-knowledge-qa.md)；文档上传解析链路见 [docs/specs/rag-document-parsing.md](docs/specs/rag-document-parsing.md)。
+
 ### RAG + Agent 后续 TODO
 
-- [ ] 为 `/rag/agent/stream` 增加前端传入 Skills 限制方案：请求可携带允许使用的 skill 名称列表，例如 `allowedSkills: ["translate", "text-optimize"]`，服务端将其转换为 Claude Agent SDK 可执行范围，确保回答阶段只允许使用前端显式传入的 Skills。第一版 `/rag/agent/stream` 先保持 Claude Agent SDK 原生 Skills 感知能力，不额外限制具体 Skills。
+- [ ] 为 `/agent-sdk/rag/stream` 增加可选的 Skills 白名单（例如 `allowedSkills`），在保持默认 `allowed_tools=[]` 的前提下，将范围收窄为前端显式传入的 Skills。
 
 ## 部署
 

@@ -15,6 +15,13 @@ def rag_direct_tools_schema() -> list[dict[str, Any]]:
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "minimum": 1},
+                    "retrieve_top_k": {"type": "integer", "minimum": 1},
+                    "final_top_k": {"type": "integer", "minimum": 1},
+                    "query_rewrite": {"type": "boolean"},
+                    "multi_query": {"type": "boolean"},
+                    "rerank": {"type": "boolean"},
+                    "rerank_provider": {"type": "string"},
+                    "context_window": {"type": "integer", "minimum": 0},
                 },
                 "required": ["query"],
             },
