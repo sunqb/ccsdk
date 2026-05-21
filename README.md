@@ -4,14 +4,34 @@
 
 ## 特性
 
-- ✅ **完全兼容 cc-agent-sdk API**：实现所有核心端点
-- ✅ **Skills 自动匹配**：Claude 根据 description 自动调用 Skills
-- ✅ **SSE 流式响应**：实时推送 Agent 执行事件
-- ✅ **会话管理**：支持 `conversationId` 进行会话继续，重启后可恢复（file/db 模式）
-- ✅ **用户数据隔离**：每个会话独立工作目录，生成文件完全隔离
-- ✅ **文件静态访问**：配合 Nginx 将生成文件映射为 HTTP URL，前端可直接访问
-- ✅ **请求级配置覆盖**：支持 `model`、`baseURL`、`apiKey` 覆盖
+### Agent 与 API
+
+- ✅ **完全兼容 cc-agent-sdk API**：`/agent-sdk/stream`、history、projects、conversations 等核心端点
+- ✅ **SSE 流式响应**：实时推送 Agent 事件；支持 `eventMode`（`full` / `text_only`）与 `resultMode`（`full` / `empty` / `none`）
+- ✅ **请求级配置覆盖**：支持 `model`、`baseURL`、`apiKey`、`cwd`、`allowedTools`、`maxTurns` 等覆盖
+- ✅ **API Key 鉴权**：通过 `AGENT_SDK_API_KEY` 保护接口（未配置时不启用）
 - ✅ **中文支持**：正确处理中文输出编码
+
+### Skills 与工作区
+
+- ✅ **Skills 自动匹配**：Claude 根据 description 自动调用 `.claude/skills/` 下的 Skills
+- ✅ **Skills 管理 API**：`GET/POST/DELETE /skills` 查询、创建、删除 Skills
+- ✅ **MCP 与权限注入**：通过环境变量注入附加 settings、permissions 与 MCP 服务，无需手写 `.claude/settings.json`
+- ✅ **工具安全策略**：`GLOBAL_DISALLOWED_TOOLS` 全局禁用危险工具（默认禁用 `Write`/`Bash`）
+
+### 会话与隔离
+
+- ✅ **会话管理**：`conversationId` 续聊；`SESSION_STORE` 支持 `memory` / `file` / `db` 存储后端
+- ✅ **用户数据隔离**：请求级 `cwd`，或 `SESSION_ISOLATED_WORKDIR` 按会话自动隔离工作目录
+- ✅ **文件静态访问**：配合 Nginx 将生成文件映射为 HTTP URL，前端可直接访问
+
+### RAG 知识库问答
+
+- ✅ **知识库与临时文件**：持久化知识库 + 上传 `.txt/.md/.pdf/.docx` 进行问答
+- ✅ **Claude SDK 统一编排**：RAG 流式走 Agent SDK + request-scoped in-process MCP（推荐 `POST /agent-sdk/rag/stream`）
+- ✅ **检索增强**：混合检索、多 query 扩展、rerank、引用对齐校验与资料不足拒答
+- ✅ **文档解析可配置**：`RAG_PARSER_PROVIDER=local` 本地解析，或 `mineru` 调用 MinerU 解析 PDF/DOCX（可配置回退）
+- ✅ **运维接口**：知识库 CRUD、索引状态、provider 信息、检索评测与过期清理
 
 ## 快速开始
 
@@ -870,3 +890,18 @@ MIT
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request！
+
+### 分支约定
+
+- **`main`**：稳定分支，**禁止直接在 `main` 上提交或推送功能改动**
+- **特性分支**（如 `rag`、`feature/xxx`）：在此开发、提交，经 Review 后合并到 `main`
+
+推荐流程：
+
+```bash
+git checkout main && git pull
+git checkout -b feature/your-change
+# ... 开发与提交 ...
+git checkout main && git merge feature/your-change
+git push origin main
+```
