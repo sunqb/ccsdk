@@ -64,7 +64,9 @@ async def _main() -> int:
         cwd=sandbox_cwd,
         metadata=request.get("metadata") or {},
     )
-    session.metadata["virtual_space_workspace"] = workspace
+    # Keep host-side virtual_space_* metadata intact. The worker only knows
+    # container paths, so expose them under sandbox_* keys instead.
+    session.metadata["sandbox_workspace"] = workspace
 
     service = AgentService()
     async for event in service._query_with_sdk(

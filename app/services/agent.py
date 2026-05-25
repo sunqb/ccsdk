@@ -265,6 +265,22 @@ class AgentService:
                 ):
                     if raw_event.get("type") == "__sandbox_metadata":
                         metadata = raw_event.get("data") or {}
+                        metadata = dict(metadata)
+
+                        # Compatibility guard for older sandbox images: they
+                        # may report container-only /sandbox paths under
+                        # host-side virtual_space_* metadata keys. Preserve the
+                        # host paths that were prepared before launching Docker.
+                        for key in (
+                            "virtual_space_root",
+                            "virtual_space_workspace",
+                            "virtual_space_skills_dir",
+                            "virtual_space_home",
+                        ):
+                            value = str(metadata.get(key, ""))
+                            if value == "/sandbox" or value.startswith("/sandbox/"):
+                                metadata.pop(key, None)
+
                         await session_manager.update_session_metadata(session.id, metadata)
                         continue
                     yield AgentEvent(
