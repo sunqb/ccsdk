@@ -22,6 +22,7 @@ from ..models.rag import (
     KnowledgeBaseListResponse,
     RagAnswer,
     RagFileSetStatusResponse,
+    RagSource,
     RagStreamRequest,
     UploadFileResponse,
 )
@@ -176,14 +177,103 @@ def _active_rag_agent_runner() -> RagAgentRunner:
     )
 
 
+class _NameResolutionError(Exception):
+    """名称解析失败时抛出，携带具体错误信息。"""
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"Knowledge base name not found: {name}")
+
+
+async def _resolve_request_sources(request: RagStreamRequest) -> list[RagSource]:
+    """解析请求中的所有检索来源，包括 knowledgeBaseName/Names。
+
+    将所有来源合并为 RagSource 列表，去重后返回。
+    如果某个 knowledgeBaseName 不存在，抛出 _NameResolutionError。
+    """
+    from ..models.rag import RagSource as _RagSource
+
+    sources: list[_RagSource] = []
+    seen: set[str] = set()
+
+    def _add_source(src: _RagSource) -> None:
+        dedup_key = f"{src.type}:{src.id}"
+        if dedup_key not in seen:
+            seen.add(dedup_key)
+            sources.append(src)
+
+    # 1. 显式 sources（保留原样）
+    if request.sources is not None:
+        for src in request.sources:
+            _add_source(src)
+
+    # 2. knowledgeBaseId
+    if request.knowledge_base_id:
+        _add_source(_RagSource(type="knowledge_base", id=request.knowledge_base_id))
+
+    # 3. fileSetId
+    if request.file_set_id:
+        _add_source(_RagSource(type="file_set", id=request.file_set_id))
+
+    # 4. knowledgeBaseName / knowledgeBaseNames
+    kb_names = request.get_knowledge_base_names()
+    if kb_names:
+        tenant_id = None
+        owner_id = None
+        api_key_id = None
+        if request.sources:
+            for src in request.sources:
+                if src.metadata:
+                    tenant_id = tenant_id or src.metadata.get("tenant_id") or src.metadata.get("tenantId")
+                    owner_id = owner_id or src.metadata.get("owner_id") or src.metadata.get("ownerId")
+                    api_key_id = api_key_id or src.metadata.get("api_key_id") or src.metadata.get("apiKeyId")
+
+        try:
+            resolved = await rag_ingestion_service.resolve_knowledge_base_names(
+                kb_names,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                api_key_id=api_key_id,
+            )
+        except ValueError as exc:
+            raise _NameResolutionError(
+                exc.args[0].replace("Knowledge base name not found: ", "")
+            ) from exc
+        for name, kb_id in resolved:
+            _add_source(_RagSource(
+                type="knowledge_base",
+                id=kb_id,
+                metadata={"knowledgeBaseName": name},
+            ))
+
+    return sources
+
+
 async def _generate_rag_stream(request: RagStreamRequest) -> AsyncGenerator[str, None]:
     request_id = f"req_{uuid4().hex}"
+
+    # 解析 knowledgeBaseName/Names，合并所有 sources
+    try:
+        resolved_sources = await _resolve_request_sources(request)
+    except _NameResolutionError as exc:
+        yield _sse_event(
+            "error",
+            {
+                "code": "knowledge_base_not_found",
+                "message": str(exc),
+                "requestId": request_id,
+            },
+        )
+        return
+
+    if resolved_sources:
+        request.sources = resolved_sources
+
     if not request.get_sources():
         yield _sse_event(
             "error",
             {
                 "code": "missing_sources",
-                "message": "Provide fileSetId, knowledgeBaseId, or sources.",
+                "message": "Provide fileSetId, knowledgeBaseId, knowledgeBaseName, knowledgeBaseNames, or sources.",
                 "requestId": request_id,
             },
         )
@@ -205,12 +295,30 @@ async def _generate_rag_stream(request: RagStreamRequest) -> AsyncGenerator[str,
 async def _generate_rag_agent_stream(request: RagStreamRequest) -> AsyncGenerator[str, None]:
     """Claude Agent SDK primary path: RAG MCP + native Skills (allowed_tools=[] 表示 Skills 全开)."""
     request_id = f"req_{uuid4().hex}"
+
+    # 解析 knowledgeBaseName/Names，合并所有 sources
+    try:
+        resolved_sources = await _resolve_request_sources(request)
+    except _NameResolutionError as exc:
+        yield _sse_event(
+            "error",
+            {
+                "code": "knowledge_base_not_found",
+                "message": str(exc),
+                "requestId": request_id,
+            },
+        )
+        return
+
+    if resolved_sources:
+        request.sources = resolved_sources
+
     if not request.get_sources():
         yield _sse_event(
             "error",
             {
                 "code": "missing_sources",
-                "message": "Provide fileSetId, knowledgeBaseId, or sources.",
+                "message": "Provide fileSetId, knowledgeBaseId, knowledgeBaseName, knowledgeBaseNames, or sources.",
                 "requestId": request_id,
             },
         )
@@ -234,12 +342,11 @@ async def _generate_rag_agent_stream(request: RagStreamRequest) -> AsyncGenerato
 
 @router.post(
     "/files",
-    summary="上传 RAG 文档并创建 fileSet",
+    summary="上传 RAG 文档并创建 fileSet（可指定知识库名称）",
     description=(
         "上传一个或多个文档，服务端会完成解析、切分、embedding 和索引，"
-        "并返回后续问答使用的 fileSetId。该接口只负责文档入库，不直接回答问题；"
-        "拿到 fileSetId 后请调用 /agent-sdk/rag/stream 或 /rag/query 进行问答。"
-        "兼容 file（单文件）和 files（多文件）两个 multipart 字段。"
+        "并返回后续问答使用的 fileSetId。如果传了 knowledgeBaseName，"
+        "则自动创建命名知识库。兼容 file（单文件）和 files（多文件）两个 multipart 字段。"
     ),
     dependencies=[Depends(verify_api_key)],
 )
@@ -262,37 +369,38 @@ async def upload_rag_files(
         str | None,
         Form(description="可选 JSON 对象字符串，会合并到文档和 chunk metadata 中。"),
     ] = None,
+    knowledge_base_name: Annotated[
+        str | None,
+        Form(alias="knowledgeBaseName", description="知识库名称，如 zsk1。传了则自动创建命名知识库。"),
+    ] = None,
+    knowledge_base_description: Annotated[
+        str | None,
+        Form(alias="knowledgeBaseDescription", description="知识库描述。"),
+    ] = None,
 ) -> UploadFileResponse:
     """
-    【前端可用】上传文档并建立临时 RAG fileSet。
+    【前端可用】上传文档并建立临时 RAG fileSet，可选同时创建命名知识库。
 
     适用场景：
     - 前端上传 txt/md/pdf/docx 等文档，随后通过 fileSetId 调用 `/agent-sdk/rag/stream`。
+    - 传 knowledgeBaseName 时，上传完成后自动创建命名知识库，后续可用名称问答。
     - 单文件可使用 multipart 字段 `file`；多文件可重复使用 multipart 字段 `files`。
-    - 只做文档解析与索引，不直接进行问答；问答接口是 `/agent-sdk/rag/stream` 或 `/rag/query`。
-    - 临时文档问答，不一定创建长期知识库。
+    - 只做文档解析与索引，不直接进行问答。
 
     返回值中的 `fileSetId` 是后续 RAG 问答的主要输入。
+    如果传了 knowledgeBaseName，返回值中的 `knowledgeBase` 包含创建的知识库信息。
     """
     parsed_metadata = _parse_metadata(metadata)
     ingest_files: list[IngestFile] = []
 
     upload_files: list[UploadFile] = []
     form = await request.form()
-    # OpenAPI exposes a single `file` field for better UI compatibility, but clients may
-    # repeat the same multipart field to upload multiple files.
     for item in form.getlist("file"):
         if isinstance(item, StarletteUploadFile):
             upload_files.append(item)
-
-    # Backward-compatible multi-file support: older clients may repeat multipart field "files".
-    # Empty fields such as `-F files=` are ignored instead of failing validation.
     for item in form.getlist("files"):
         if isinstance(item, StarletteUploadFile):
             upload_files.append(item)
-
-    # Some clients may send a single file in a way that FastAPI binds but Starlette's form
-    # cache does not expose as expected. Keep the typed parameter as a final fallback.
     if not upload_files and file is not None:
         upload_files.append(file)
 
@@ -311,7 +419,7 @@ async def upload_rag_files(
 
     try:
         async with rag_ingestion_guard.slot():
-            return await rag_ingestion_service.ingest_files(
+            upload_response = await rag_ingestion_service.ingest_files(
                 ingest_files,
                 conversation_id=conversation_id,
                 metadata=parsed_metadata,
@@ -320,6 +428,43 @@ async def upload_rag_files(
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 如果传了 knowledgeBaseName，自动创建命名知识库
+    if knowledge_base_name and knowledge_base_name.strip():
+        kb_name = knowledge_base_name.strip()
+        if upload_response.status not in {"ready", "partial_ready"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Files not ready for knowledge base creation, cannot assign name",
+            )
+
+        # 检查重名
+        name_conflict = await rag_ingestion_service.check_name_conflict(
+            kb_name,
+            tenant_id=parsed_metadata.get("tenant_id") or parsed_metadata.get("tenantId"),
+            owner_id=parsed_metadata.get("owner_id") or parsed_metadata.get("ownerId"),
+        )
+        if name_conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Knowledge base name already exists: {kb_name}",
+            )
+
+        try:
+            kb_info = await rag_ingestion_service.create_knowledge_base_from_file_set(
+                file_set_id=upload_response.file_set_id,
+                name=kb_name,
+                description=knowledge_base_description,
+                tenant_id=parsed_metadata.get("tenant_id") or parsed_metadata.get("tenantId"),
+                owner_id=parsed_metadata.get("owner_id") or parsed_metadata.get("ownerId"),
+                api_key_id=parsed_metadata.get("api_key_id") or parsed_metadata.get("apiKeyId"),
+                metadata=parsed_metadata,
+            )
+            upload_response.knowledge_base = kb_info
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return upload_response
 
 
 @router.get("/files/{file_set_id}/status", dependencies=[Depends(verify_api_key)])
@@ -364,12 +509,23 @@ async def list_knowledge_bases(
     tenant_id: str | None = Query(None, alias="tenantId"),
     owner_id: str | None = Query(None, alias="ownerId"),
     api_key_id: str | None = Query(None, alias="apiKeyId"),
+    name: str | None = Query(None, alias="name", description="按名称精确过滤"),
 ) -> KnowledgeBaseListResponse:
     """
     【管理/前端可用】列出持久知识库。
 
     适用场景：前端让用户选择已有 knowledgeBaseId，或后台查看知识库列表。
+    支持按名称精确过滤。
     """
+    # 如果 MySQL 可用且传了 name，优先从 MySQL 查
+    if name:
+        kb_info = await rag_ingestion_service.get_knowledge_base_by_name(
+            name, tenant_id=tenant_id, owner_id=owner_id, api_key_id=api_key_id,
+        )
+        if kb_info:
+            return KnowledgeBaseListResponse(knowledgeBases=[kb_info])
+        return KnowledgeBaseListResponse(knowledgeBases=[])
+
     return KnowledgeBaseListResponse(
         knowledgeBases=rag_ingestion_service.list_knowledge_bases(
             tenant_id=tenant_id,
@@ -501,13 +657,30 @@ async def rag_query(request: RagStreamRequest) -> RagAnswer:
     前端聊天主流程优先使用 `/agent-sdk/rag/stream`。
     """
     request_id = f"req_{uuid4().hex}"
+
+    # 解析 knowledgeBaseName/Names，合并所有 sources
+    try:
+        resolved_sources = await _resolve_request_sources(request)
+    except _NameResolutionError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "knowledge_base_not_found",
+                "message": str(exc),
+                "requestId": request_id,
+            },
+        ) from exc
+
+    if resolved_sources:
+        request.sources = resolved_sources
+
     sources = request.get_sources()
     if not sources:
         raise HTTPException(
             status_code=400,
             detail={
                 "code": "missing_sources",
-                "message": "Provide fileSetId, knowledgeBaseId, or sources.",
+                "message": "Provide fileSetId, knowledgeBaseId, knowledgeBaseName, knowledgeBaseNames, or sources.",
                 "requestId": request_id,
             },
         )

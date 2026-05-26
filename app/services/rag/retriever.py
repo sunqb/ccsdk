@@ -8,7 +8,7 @@ from ...config import settings
 from ...models.rag import RagCitation, RagRequestContext, RagSource
 from .answer_verifier import rag_answer_verifier
 from .chunker import RagChunk
-from .embeddings import EmbeddingProvider, LocalHashEmbeddingProvider
+from .embeddings import EmbeddingProvider
 from .ingestion import rag_ingestion_service
 from .reranker import build_reranker
 from .vector_store import LocalVectorStore, SearchResult, TOKEN_RE
@@ -57,7 +57,7 @@ class RagRetriever:
         embedder: EmbeddingProvider | None = None,
         vector_store: LocalVectorStore | None = None,
     ) -> None:
-        self.embedder = embedder or LocalHashEmbeddingProvider()
+        self.embedder = embedder or rag_ingestion_service.embedder
         self.vector_store = vector_store or rag_ingestion_service.get_vector_store()
 
     async def search(

@@ -1,6 +1,8 @@
 """
 RAG 请求、响应与内部数据模型定义。
 """
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any, Literal
 
@@ -138,6 +140,25 @@ class RagFileInfo(BaseModel):
         populate_by_name = True
 
 
+class KnowledgeBaseInfo(BaseModel):
+    """Persistent knowledge base metadata."""
+
+    knowledge_base_id: str = Field(..., alias="knowledgeBaseId", description="知识库 ID")
+    name: str = Field(..., description="知识库名称")
+    description: str | None = Field(None, description="知识库描述")
+    source_file_set_id: str = Field(..., alias="sourceFileSetId", description="来源 fileSet ID")
+    status: str = Field(..., description="知识库状态")
+    created_at: datetime = Field(..., alias="createdAt", description="创建时间")
+    updated_at: datetime = Field(..., alias="updatedAt", description="更新时间")
+    tenant_id: str | None = Field(None, alias="tenantId", description="租户 ID")
+    owner_id: str | None = Field(None, alias="ownerId", description="所有者 ID")
+    api_key_id: str | None = Field(None, alias="apiKeyId", description="API Key ID")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="知识库元数据")
+
+    class Config:
+        populate_by_name = True
+
+
 class UploadFileResponse(BaseModel):
     """RAG 文件上传响应。"""
 
@@ -145,6 +166,11 @@ class UploadFileResponse(BaseModel):
     status: RagFileStatus = Field(..., description="文件集索引状态")
     conversation_id: str | None = Field(None, alias="conversationId", description="会话 ID")
     files: list[RagFileInfo] = Field(default_factory=list, description="上传文件列表")
+    knowledge_base: KnowledgeBaseInfo | None = Field(
+        None,
+        alias="knowledgeBase",
+        description="上传时指定 knowledgeBaseName 时自动创建的知识库",
+    )
 
     class Config:
         populate_by_name = True
@@ -156,25 +182,6 @@ class CreateKnowledgeBaseRequest(BaseModel):
     name: str = Field(..., min_length=1, description="知识库名称")
     description: str | None = Field(None, description="知识库描述")
     source_file_set_id: str = Field(..., alias="sourceFileSetId", description="来源 fileSet ID")
-    tenant_id: str | None = Field(None, alias="tenantId", description="租户 ID")
-    owner_id: str | None = Field(None, alias="ownerId", description="所有者 ID")
-    api_key_id: str | None = Field(None, alias="apiKeyId", description="API Key ID")
-    metadata: dict[str, Any] = Field(default_factory=dict, description="知识库元数据")
-
-    class Config:
-        populate_by_name = True
-
-
-class KnowledgeBaseInfo(BaseModel):
-    """Persistent knowledge base metadata."""
-
-    knowledge_base_id: str = Field(..., alias="knowledgeBaseId", description="知识库 ID")
-    name: str = Field(..., description="知识库名称")
-    description: str | None = Field(None, description="知识库描述")
-    source_file_set_id: str = Field(..., alias="sourceFileSetId", description="来源 fileSet ID")
-    status: str = Field(..., description="知识库状态")
-    created_at: datetime = Field(..., alias="createdAt", description="创建时间")
-    updated_at: datetime = Field(..., alias="updatedAt", description="更新时间")
     tenant_id: str | None = Field(None, alias="tenantId", description="租户 ID")
     owner_id: str | None = Field(None, alias="ownerId", description="所有者 ID")
     api_key_id: str | None = Field(None, alias="apiKeyId", description="API Key ID")
@@ -224,6 +231,16 @@ class RagStreamRequest(BaseModel):
     )
     file_set_id: str | None = Field(None, alias="fileSetId", description="文件集 ID")
     sources: list[RagSource] | None = Field(None, description="显式检索来源")
+    knowledge_base_name: str | None = Field(
+        None,
+        alias="knowledgeBaseName",
+        description="知识库名称，如 zsk1",
+    )
+    knowledge_base_names: list[str] | None = Field(
+        None,
+        alias="knowledgeBaseNames",
+        description="多个知识库名称，如 [\"zsk1\", \"zsk2\"]",
+    )
     options: RagQueryOptions = Field(default_factory=RagQueryOptions, description="RAG 选项")
     model: str | None = Field(None, description="模型名称，覆盖默认配置")
     base_url: str | None = Field(None, alias="baseURL", description="API Base URL")
@@ -244,6 +261,19 @@ class RagStreamRequest(BaseModel):
         if self.file_set_id:
             sources.append(RagSource(type="file_set", id=self.file_set_id))
         return sources
+
+    def get_knowledge_base_names(self) -> list[str]:
+        """统一获取单个和多个知识库名称，去空格、去重、保序。"""
+        names: list[str] = []
+        if self.knowledge_base_name and self.knowledge_base_name.strip():
+            names.append(self.knowledge_base_name.strip())
+        if self.knowledge_base_names:
+            for n in self.knowledge_base_names:
+                if n and n.strip():
+                    stripped = n.strip()
+                    if stripped not in names:
+                        names.append(stripped)
+        return names
 
 
 class RagAnswer(BaseModel):

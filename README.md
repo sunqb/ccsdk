@@ -488,14 +488,50 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 |--------|------|--------|
 | `RAG_ENABLED` | 是否启用 RAG | `false` |
 | `RAG_STORAGE_DIR` | 状态与向量快照目录 | `${WORK_DIR}/rag` |
-| `RAG_VECTOR_PROVIDER` | 向量库：`local`（可用）；qdrant/pgvector/milvus 预留 | `local` |
-| `RAG_EMBEDDING_PROVIDER` | Embedding：`openai_compatible` 等 | `openai_compatible` |
+| `RAG_VECTOR_PROVIDER` | 向量库 provider。当前真实可用：`local`；`qdrant` / `pgvector` / `milvus` 为预留 | `local` |
+| `RAG_EMBEDDING_PROVIDER` | Embedding provider。支持 `local` / `openai_compatible` | `openai_compatible` |
+| `RAG_EMBEDDING_MODEL` | Embedding 模型名称，例如 `bge-m3:latest` | `text-embedding-3-small` |
+| `RAG_EMBEDDING_BASE_URL` | OpenAI-compatible embedding 服务地址，例如 `http://host:port/v1` | 空 |
+| `RAG_EMBEDDING_API_KEY` | Embedding 服务 API Key | 空 |
 | `RAG_PARSER_PROVIDER` | 解析：`local` / `mineru` | `local` |
 | `MINERU_*` | MinerU 地址、密钥、超时、回退 | 见 `.env.example` |
 | `RAG_ALLOWED_EXTENSIONS` | 允许上传扩展名 | `.txt,.md,.pdf,.docx` |
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | 切分参数 | `1000` / `120` |
 | `RAG_MAX_CONCURRENT_INGESTIONS` | 入库并发上限 | `4` |
 | `RAG_MAX_CONCURRENT_QUERIES` | 查询并发上限 | `16` |
+
+#### BGE-M3 embedding + local vector store 示例
+
+开发环境可以使用远程 BGE-M3 作为 embedding 模型，同时继续使用本地 `LocalVectorStore` 作为向量存储：
+
+```env
+RAG_ENABLED=true
+
+# 向量库：本地开发/单机测试
+RAG_VECTOR_PROVIDER=local
+
+# Embedding：OpenAI-compatible BGE-M3
+RAG_EMBEDDING_PROVIDER=openai_compatible
+RAG_EMBEDDING_MODEL=bge-m3:latest
+RAG_EMBEDDING_BASE_URL=http://zktz.4c888.com:62011/v1
+RAG_EMBEDDING_API_KEY=<your-api-key>
+```
+
+链路如下：
+
+```text
+文档文本
+  ↓
+BGE-M3 生成 1024 维 embedding
+  ↓
+LocalVectorStore 保存 chunk + embedding
+  ↓
+查询文本通过同一 BGE-M3 生成 query embedding
+  ↓
+LocalVectorStore 做 cosine similarity 检索
+```
+
+该组合适合开发验证和单机小规模测试。生产环境建议替换为 Qdrant、Milvus、pgvector 等真实向量数据库。
 
 ## 项目结构
 
@@ -523,8 +559,9 @@ ccsdk/
 │           ├── ingestion.py    # 上传入库
 │           ├── parser.py       # local / MinerU 文档解析
 │           ├── chunker.py      # 文本切分
-│           ├── embeddings.py   # Embedding provider
-│           ├── vector_store.py # 本地向量检索
+│           ├── embeddings.py          # Embedding provider 实现
+│           ├── embedding_factory.py   # Embedding 单点真值与健康检查
+│           ├── vector_store.py        # 本地向量检索与维度一致性防护
 │           ├── retriever.py    # 混合检索 + rerank
 │           ├── mcp.py          # in-process RAG MCP 四件套
 │           ├── agent_runner.py # RAG 流式编排（Claude SDK）

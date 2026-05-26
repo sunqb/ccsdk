@@ -7,14 +7,24 @@ from .embeddings import (
     LocalHashEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
 )
+from .embedding_factory import (
+    EmbeddingProfile,
+    get_embedder,
+    get_embedding_profile,
+    health_check as embedding_health_check,
+    validate_dimension_compatibility,
+    reset as reset_embedding_factory,
+)
 from .ingestion import (
     FileSetRecord,
     IngestFile,
     KnowledgeBaseRecord,
     RagIngestionService,
     rag_ingestion_service,
+    set_mysql_store_for_ingestion,
 )
 from .mcp import RAG_MCP_ALLOWED_TOOLS, create_rag_mcp_server
+from .mysql_store import RagMySqlStore, rag_mysql_store
 from .parser import ParsedDocument, TextDocumentParser
 from .production import RagConcurrencyGuard, build_provider_info
 from .answer_verifier import RagAnswerVerifier, RagVerificationResult, rag_answer_verifier
@@ -49,6 +59,7 @@ __all__ = [
     "RagAnswerVerifier",
     "RagConcurrencyGuard",
     "RagIngestionService",
+    "RagMySqlStore",
     "RagRetriever",
     "RagToolExecutor",
     "RagToolService",
@@ -68,11 +79,13 @@ __all__ = [
     "build_reranker",
     "evaluate_retrieval_cases",
     "new_retrieval_trace",
+    "set_mysql_store_for_ingestion",
     "structured_abstention_answer",
     "create_rag_mcp_server",
     "rag_answer_verifier",
     "rag_agent_runner",
     "rag_ingestion_service",
+    "rag_mysql_store",
     "rag_retriever",
     "rag_tool_executor",
     "rag_tool_service",

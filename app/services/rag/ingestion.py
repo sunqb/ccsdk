@@ -16,7 +16,8 @@ from ...models.rag import (
     UploadFileResponse,
 )
 from .chunker import RagChunk, TextChunker
-from .embeddings import EmbeddingProvider, LocalHashEmbeddingProvider
+from .embedding_factory import get_embedder, get_embedding_profile, validate_dimension_compatibility
+from .embeddings import EmbeddingProvider
 from .parser import DocumentParser, HybridDocumentParser, LocalDocumentParser
 from .state_store import SQLiteRagStateStore
 from .vector_store import LocalVectorStore, VectorStore
@@ -77,6 +78,9 @@ class RagIngestionService:
     provided, local metadata and local-vector chunks are snapshotted to SQLite
     after successful state transitions so managed knowledge bases survive
     process restarts.
+
+    When MySQL is configured (RAG_DB_DSN), knowledge base metadata is also
+    persisted to structured MySQL tables for durable name-to-ID resolution.
     """
 
     def __init__(
@@ -87,15 +91,17 @@ class RagIngestionService:
         embedder: EmbeddingProvider | None = None,
         vector_store: VectorStore | None = None,
         state_store: SQLiteRagStateStore | None = None,
+        mysql_store: Any | None = None,
     ) -> None:
         self.parser = parser or self._build_parser()
         self.chunker = chunker or TextChunker(
             chunk_size=settings.rag_chunk_size,
             chunk_overlap=settings.rag_chunk_overlap,
         )
-        self.embedder = embedder or LocalHashEmbeddingProvider()
+        self.embedder = embedder or self._build_embedder()
         self.vector_store = vector_store or LocalVectorStore()
         self.state_store = state_store
+        self.mysql_store = mysql_store
         self._records: dict[str, FileSetRecord] = {}
         self._knowledge_bases: dict[str, KnowledgeBaseRecord] = {}
         self._ingestion_jobs: dict[str, dict[str, Any]] = {}
@@ -323,7 +329,113 @@ class RagIngestionService:
         record.api_key_id = resolved_api_key_id
         record.updated_at = now
         self._persist_state()
+
+        # MySQL 持久化
+        if self.mysql_store is not None:
+            try:
+                await self.mysql_store.save_knowledge_base(
+                    knowledge_base_id=knowledge_base_id,
+                    name=name,
+                    source_file_set_id=file_set_id,
+                    status="ready",
+                    description=description,
+                    tenant_id=resolved_tenant_id,
+                    owner_id=resolved_owner_id,
+                    api_key_id=resolved_api_key_id,
+                    vector_provider=settings.rag_vector_provider,
+                    metadata=resolved_metadata,
+                )
+                await self.mysql_store.update_file_set_kb_binding(file_set_id, knowledge_base_id)
+            except Exception as exc:
+                print(f"[RAG] MySQL persist knowledge base warning: {exc}")
+
         return self._knowledge_base_info(kb)
+
+    async def get_knowledge_base_by_name(
+        self,
+        name: str,
+        *,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+        api_key_id: str | None = None,
+    ) -> KnowledgeBaseInfo | None:
+        """按名称查找知识库。优先查 MySQL，回退查内存。"""
+        if self.mysql_store is not None:
+            kb_dict = await self.mysql_store.get_knowledge_base_by_name(
+                name, tenant_id=tenant_id, owner_id=owner_id, api_key_id=api_key_id,
+            )
+            if kb_dict is not None:
+                return KnowledgeBaseInfo(
+                    knowledgeBaseId=kb_dict["knowledge_base_id"],
+                    name=kb_dict["name"],
+                    description=kb_dict.get("description"),
+                    sourceFileSetId=kb_dict["source_file_set_id"],
+                    status=kb_dict.get("status", "ready"),
+                    createdAt=kb_dict.get("created_at") or datetime.now(UTC),
+                    updatedAt=kb_dict.get("updated_at") or datetime.now(UTC),
+                    tenantId=kb_dict.get("tenant_id"),
+                    ownerId=kb_dict.get("owner_id"),
+                    apiKeyId=kb_dict.get("api_key_id"),
+                    metadata=kb_dict.get("metadata") or {},
+                )
+
+        for kb in self._knowledge_bases.values():
+            if kb.name != name:
+                continue
+            if tenant_id is not None and kb.tenant_id != tenant_id:
+                continue
+            if owner_id is not None and kb.owner_id != owner_id:
+                continue
+            if api_key_id is not None and kb.api_key_id != api_key_id:
+                continue
+            return self._knowledge_base_info(kb)
+        return None
+
+    async def check_name_conflict(
+        self,
+        name: str,
+        *,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> bool:
+        """检查同作用域下知识库名称是否冲突。"""
+        if self.mysql_store is not None:
+            exists = await self.mysql_store.check_name_exists(
+                name, tenant_id=tenant_id, owner_id=owner_id,
+            )
+            if exists:
+                return True
+
+        for kb in self._knowledge_bases.values():
+            if kb.name == name:
+                if tenant_id is not None and kb.tenant_id != tenant_id:
+                    continue
+                if owner_id is not None and kb.owner_id != owner_id:
+                    continue
+                return True
+        return False
+
+    async def resolve_knowledge_base_names(
+        self,
+        names: list[str],
+        *,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+        api_key_id: str | None = None,
+    ) -> list[tuple[str, str]]:
+        """解析知识库名称为 (name, knowledge_base_id) 列表。
+
+        Raises ValueError 如果任何名称不存在。
+        """
+        results: list[tuple[str, str]] = []
+        for name in names:
+            kb_info = await self.get_knowledge_base_by_name(
+                name, tenant_id=tenant_id, owner_id=owner_id, api_key_id=api_key_id,
+            )
+            if kb_info is None:
+                raise ValueError(f"Knowledge base name not found: {name}")
+            results.append((name, kb_info.knowledge_base_id))
+        return results
 
     def list_knowledge_bases(
         self,
@@ -380,9 +492,16 @@ class RagIngestionService:
         if isinstance(self.vector_store, LocalVectorStore):
             chunks = self.vector_store.dump_records()
 
+        profile = get_embedding_profile()
         self.state_store.save(
             {
-                "version": 1,
+                "version": 2,
+                "embeddingProfile": {
+                    "provider": profile.provider,
+                    "model": profile.model,
+                    "dimension": profile.dimension,
+                    "base_url": profile.base_url,
+                },
                 "fileSets": [self._file_set_record_payload(record) for record in self._records.values()],
                 "knowledgeBases": [
                     self._knowledge_base_record_payload(record)
@@ -394,13 +513,26 @@ class RagIngestionService:
         )
 
     def _load_state(self) -> None:
-        """Restore a persisted local snapshot if available."""
+        """Restore a persisted local snapshot if available.
+
+        加载时校验嵌入模型维度一致性：如果 snapshot 中记录的维度与当前
+        embedder 不匹配，清除旧向量数据并打印警告（而非静默降级）。
+        """
         if self.state_store is None:
             return
 
         snapshot = self.state_store.load()
         if not snapshot:
             return
+
+        # ---- 偏差检测：校验嵌入模型一致性 ----
+        stored_profile = snapshot.get("embeddingProfile")
+        if stored_profile and isinstance(stored_profile, dict):
+            stored_dimension = stored_profile.get("dimension")
+            if stored_dimension is not None:
+                warnings = validate_dimension_compatibility(stored_dimension)
+                for warning in warnings:
+                    print(f"[RAG WARNING] {warning}")
 
         self._records = {
             record.file_set_id: record
@@ -426,7 +558,22 @@ class RagIngestionService:
         if isinstance(self.vector_store, LocalVectorStore):
             raw_chunks = snapshot.get("chunks", [])
             if isinstance(raw_chunks, list):
-                self.vector_store.load_records([item for item in raw_chunks if isinstance(item, dict)])
+                # 维度不匹配时跳过加载旧向量
+                profile = get_embedding_profile()
+                skip_vectors = False
+                if stored_profile and isinstance(stored_profile, dict):
+                    stored_dim = stored_profile.get("dimension")
+                    if stored_dim is not None and stored_dim != profile.dimension:
+                        skip_vectors = True
+                        print(
+                            f"[RAG WARNING] Skipping {len(raw_chunks)} stored vectors "
+                            f"(stored dimension {stored_dim} != current {profile.dimension}). "
+                            f"Please re-ingest documents with the current embedding provider."
+                        )
+                if skip_vectors:
+                    self.vector_store.load_records([])
+                else:
+                    self.vector_store.load_records([item for item in raw_chunks if isinstance(item, dict)])
 
     def _build_parser(self) -> DocumentParser:
         """Build the document parser based on RAG_PARSER_PROVIDER setting."""
@@ -441,6 +588,11 @@ class RagIngestionService:
         if provider == "local":
             return LocalDocumentParser()
         raise ValueError(f"Unsupported RAG_PARSER_PROVIDER: {provider}")
+
+    @staticmethod
+    def _build_embedder() -> EmbeddingProvider:
+        """通过嵌入工厂获取全局单例 embedder。"""
+        return get_embedder()
 
     @staticmethod
     def _error_code_for_status(status: RagFileStatus) -> str:
@@ -612,3 +764,8 @@ class RagIngestionService:
 rag_ingestion_service = RagIngestionService(
     state_store=SQLiteRagStateStore(Path(settings.rag_storage_dir) / "rag.db")
 )
+
+
+def set_mysql_store_for_ingestion(mysql_store: Any) -> None:
+    """注入 MySQL 持久化存储到全局 ingestion service 实例。"""
+    rag_ingestion_service.mysql_store = mysql_store

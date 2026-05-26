@@ -127,6 +127,13 @@ class Settings:
         default_factory=lambda: os.getenv("WORK_DIR", _default_work_dir())
     )
 
+    # RAG MySQL 数据库配置
+    # 格式：mysql+asyncmy://user:pass@host:port/dbname
+    # 为空时回退到 SQLite snapshot
+    rag_db_dsn: str = field(
+        default_factory=lambda: os.getenv("RAG_DB_DSN", "")
+    )
+
     # RAG MVP 配置
     rag_enabled: bool = field(
         default_factory=lambda: _env_bool("RAG_ENABLED")

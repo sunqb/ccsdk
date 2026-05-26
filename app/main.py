@@ -18,9 +18,35 @@ VERSION = "1.0.0"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
+    # 初始化 RAG MySQL 数据库
+    if settings.rag_db_dsn:
+        try:
+            from .database import init_rag_db, is_mysql_available
+            from .services.rag import rag_mysql_store, set_mysql_store_for_ingestion
+            await init_rag_db()
+            if is_mysql_available():
+                set_mysql_store_for_ingestion(rag_mysql_store)
+                print("[RAG DB] MySQL 持久化已注入 ingestion service")
+        except Exception as exc:
+            print(f"[RAG DB] MySQL 初始化失败，回退到 SQLite: {exc}")
+
     # 启动时加载 Skills
     skills_manager.load_skills()
     print(f"Loaded {len(skills_manager.list_skills())} skills from {settings.skills_dir}")
+
+    # 嵌入模型启动偏差检测（Layer 2 反馈回路）
+    try:
+        from .services.rag import embedding_health_check, get_embedding_profile
+        profile = await embedding_health_check()
+        print(
+            f"[RAG Embedding] provider={profile.provider}, "
+            f"model={profile.model}, dimension={profile.dimension}"
+        )
+    except RuntimeError as exc:
+        print(f"[RAG Embedding WARNING] Health check failed: {exc}")
+        print("[RAG Embedding] Service will start but RAG features may not work correctly.")
+    except Exception as exc:
+        print(f"[RAG Embedding WARNING] Unexpected error during health check: {exc}")
 
     # 显示认证状态
     api_key = os.getenv("AGENT_SDK_API_KEY")
@@ -32,6 +58,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # 关闭时清理
+    if settings.rag_db_dsn:
+        try:
+            from .database import close_rag_db
+            await close_rag_db()
+        except Exception:
+            pass
     print("Shutting down...")
 
 
