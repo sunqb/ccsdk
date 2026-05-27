@@ -11,7 +11,7 @@ from .chunker import RagChunk
 from .embeddings import EmbeddingProvider
 from .ingestion import rag_ingestion_service
 from .reranker import build_reranker
-from .vector_store import LocalVectorStore, SearchResult, TOKEN_RE
+from .vector_store import SearchResult, TOKEN_RE, VectorStore
 
 QUERY_EXPANSIONS = {
     "refund": ["return", "reimburse", "rma"],
@@ -55,7 +55,7 @@ class RagRetriever:
         self,
         *,
         embedder: EmbeddingProvider | None = None,
-        vector_store: LocalVectorStore | None = None,
+        vector_store: VectorStore | None = None,
     ) -> None:
         self.embedder = embedder or rag_ingestion_service.embedder
         self.vector_store = vector_store or rag_ingestion_service.get_vector_store()

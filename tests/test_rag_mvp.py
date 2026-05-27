@@ -280,6 +280,117 @@ async def test_ingestion_ready_and_partial_ready() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ingestion_persists_mysql_file_set_file_and_chunks() -> None:
+    class FakeMySqlStore:
+        def __init__(self) -> None:
+            self.file_sets: list[dict[str, object]] = []
+            self.file_set_updates: list[dict[str, object]] = []
+            self.files: list[dict[str, object]] = []
+            self.file_updates: list[dict[str, object]] = []
+            self.chunk_batches: list[dict[str, object]] = []
+            self.ingestion_jobs: list[dict[str, object]] = []
+            self.ingestion_job_updates: list[dict[str, object]] = []
+
+        async def save_file_set(self, **kwargs: object) -> None:
+            self.file_sets.append(kwargs)
+
+        async def update_file_set_status(self, **kwargs: object) -> None:
+            self.file_set_updates.append(kwargs)
+
+        async def save_file(self, **kwargs: object) -> None:
+            self.files.append(kwargs)
+
+        async def update_file_status(self, **kwargs: object) -> None:
+            self.file_updates.append(kwargs)
+
+        async def save_chunks(self, **kwargs: object) -> None:
+            self.chunk_batches.append(kwargs)
+
+        async def create_ingestion_job(self, **kwargs: object) -> None:
+            self.ingestion_jobs.append(kwargs)
+
+        async def update_ingestion_job(self, **kwargs: object) -> None:
+            self.ingestion_job_updates.append(kwargs)
+
+    mysql_store = FakeMySqlStore()
+    service = RagIngestionService(parser=TextDocumentParser(), mysql_store=mysql_store)
+
+    response = await service.ingest_files(
+        [("policy.md", b"# Refund\n\nRefunds are available within 30 days.")],
+        conversation_id="conv_mysql",
+        metadata={"tenant_id": "tenant_1", "owner_id": "owner_1"},
+    )
+
+    assert response.status == "ready"
+    assert mysql_store.file_sets[0]["file_set_id"] == response.file_set_id
+    assert mysql_store.file_sets[0]["tenant_id"] == "tenant_1"
+    assert mysql_store.files[0]["filename"] == "policy.md"
+    assert mysql_store.file_set_updates[-1]["status"] == "ready"
+    assert mysql_store.file_set_updates[-1]["indexed_chunks"] == 1
+    assert mysql_store.chunk_batches
+    assert len(mysql_store.chunk_batches[0]["chunks"]) == 1
+    assert mysql_store.chunk_batches[0]["embedding_provider"] == "local"
+    assert mysql_store.chunk_batches[0]["embedding_dimension"] == 256
+    assert mysql_store.ingestion_jobs[0]["file_set_id"] == response.file_set_id
+    assert mysql_store.ingestion_jobs[0]["status"] == "running"
+    assert mysql_store.ingestion_job_updates[-1]["status"] == "succeeded"
+    assert mysql_store.ingestion_job_updates[-1]["progress_percent"] == 100
+
+
+@pytest.mark.asyncio
+async def test_create_knowledge_base_updates_mysql_chunk_binding() -> None:
+    class FakeMySqlStore:
+        def __init__(self) -> None:
+            self.file_sets: list[dict[str, object]] = []
+            self.file_set_updates: list[dict[str, object]] = []
+            self.files: list[dict[str, object]] = []
+            self.file_updates: list[dict[str, object]] = []
+            self.chunk_batches: list[dict[str, object]] = []
+            self.knowledge_bases: list[dict[str, object]] = []
+            self.kb_bindings: list[tuple[str, str]] = []
+            self.chunk_bindings: list[dict[str, object]] = []
+
+        async def save_file_set(self, **kwargs: object) -> None:
+            self.file_sets.append(kwargs)
+
+        async def update_file_set_status(self, **kwargs: object) -> None:
+            self.file_set_updates.append(kwargs)
+
+        async def save_file(self, **kwargs: object) -> None:
+            self.files.append(kwargs)
+
+        async def update_file_status(self, **kwargs: object) -> None:
+            self.file_updates.append(kwargs)
+
+        async def save_chunks(self, **kwargs: object) -> None:
+            self.chunk_batches.append(kwargs)
+
+        async def save_knowledge_base(self, **kwargs: object) -> None:
+            self.knowledge_bases.append(kwargs)
+
+        async def update_file_set_kb_binding(self, file_set_id: str, knowledge_base_id: str) -> None:
+            self.kb_bindings.append((file_set_id, knowledge_base_id))
+
+        async def update_chunks_knowledge_base(self, **kwargs: object) -> None:
+            self.chunk_bindings.append(kwargs)
+
+    mysql_store = FakeMySqlStore()
+    service = RagIngestionService(parser=TextDocumentParser(), mysql_store=mysql_store)
+    upload = await service.ingest_files([("policy.md", b"Refunds are available within 30 days.")])
+
+    kb = await service.create_knowledge_base_from_file_set(
+        file_set_id=upload.file_set_id,
+        name="policy-kb",
+    )
+
+    assert mysql_store.knowledge_bases[0]["knowledge_base_id"] == kb.knowledge_base_id
+    assert mysql_store.knowledge_bases[0]["embedding_provider"] == "local"
+    assert mysql_store.kb_bindings == [(upload.file_set_id, kb.knowledge_base_id)]
+    assert mysql_store.chunk_bindings[0]["file_set_id"] == upload.file_set_id
+    assert mysql_store.chunk_bindings[0]["knowledge_base_id"] == kb.knowledge_base_id
+
+
+@pytest.mark.asyncio
 async def test_retriever_citations_and_read_chunk() -> None:
     service = RagIngestionService(parser=TextDocumentParser())
     response = await service.ingest_files(

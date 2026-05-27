@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +70,7 @@ class RagAgentRunner:
         system_prompt: str,
         allowed_tools: list[str] | None = None,
         cwd: str | None = None,
+        on_complete: Callable[[dict[str, Any], RecordingRagToolService], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Primary path: Claude Agent SDK + request-scoped in-process RAG MCP tools.
 
@@ -124,17 +125,21 @@ class RagAgentRunner:
         if _should_abstain(request, verification):
             answer = structured_abstention_answer(abstention_reason_labels(verification.reasons))
 
-        yield self.sse_event(
-            "result",
-            {
-                "answer": answer,
-                "citations": [citation.model_dump(by_alias=True) for citation in citations],
-                "requestId": request_id,
-                "mode": "claude_sdk",
-                "toolCalls": recording_service.tool_calls,
-                "verification": verification.model_dump(),
-            },
-        )
+        result_payload = {
+            "answer": answer,
+            "citations": [citation.model_dump(by_alias=True) for citation in citations],
+            "requestId": request_id,
+            "mode": "claude_sdk",
+            "toolCalls": recording_service.tool_calls,
+            "verification": verification.model_dump(),
+        }
+        if on_complete is not None:
+            try:
+                await on_complete(result_payload, recording_service)
+            except Exception as exc:  # noqa: BLE001 - observability callbacks must not break streams
+                logger.warning("RAG stream completion callback failed: %s", exc)
+
+        yield self.sse_event("result", result_payload)
 
     async def stream_direct(
         self,

@@ -217,6 +217,16 @@ class Settings:
         default_factory=lambda: int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "16"))
     )
     rag_qdrant_url: str | None = field(default_factory=lambda: os.getenv("RAG_QDRANT_URL"))
+    rag_qdrant_api_key: str | None = field(default_factory=lambda: os.getenv("RAG_QDRANT_API_KEY"))
+    rag_qdrant_collection: str = field(
+        default_factory=lambda: os.getenv("RAG_QDRANT_COLLECTION", "rag_chunks")
+    )
+    rag_qdrant_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("RAG_QDRANT_TIMEOUT_SECONDS", "30"))
+    )
+    rag_qdrant_create_collection: bool = field(
+        default_factory=lambda: _env_bool("RAG_QDRANT_CREATE_COLLECTION", "true")
+    )
     rag_pgvector_dsn: str | None = field(default_factory=lambda: os.getenv("RAG_PGVECTOR_DSN"))
     rag_milvus_uri: str | None = field(default_factory=lambda: os.getenv("RAG_MILVUS_URI"))
 

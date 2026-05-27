@@ -3,14 +3,21 @@
 """
 import os
 from typing import Optional
-from fastapi import Request, HTTPException, Depends
+
+from fastapi import Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
-from .config import settings
+from .openapi_auth import API_KEY_SCHEME_NAME
 
 
-# API Key Header
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_header = APIKeyHeader(
+    name="X-API-Key",
+    auto_error=False,
+    scheme_name=API_KEY_SCHEME_NAME,
+    description=(
+        "服务 API Key。仅当服务端已配置 AGENT_SDK_API_KEY 时必填；未配置时可不填。"
+    ),
+)
 
 
 def get_api_key() -> Optional[str]:
@@ -20,7 +27,7 @@ def get_api_key() -> Optional[str]:
 
 async def verify_api_key(
     request: Request,
-    api_key: Optional[str] = Depends(api_key_header)
+    api_key: Optional[str] = Security(api_key_header),
 ) -> Optional[str]:
     """
     验证 API Key

@@ -68,6 +68,8 @@ ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
 
 ### 4. 启动服务
 
+监听端口由 **uvicorn 命令行** `--host` / `--port` 决定（与 `.env` 中 `HOST` / `PORT` 保持一致即可；当前进程不会自动读取 `PORT` 绑定端口）。
+
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -240,6 +242,72 @@ curl -X POST http://localhost:8000/agent-sdk/stream \
 | GET | `/rag/admin/stats` | 存储与索引统计 |
 | POST | `/rag/admin/evaluate` | 检索评测 |
 | POST | `/rag/admin/cleanup` | 清理过期临时 fileSet |
+
+## RAG 产品化 TODO
+
+### P2：MySQL Metadata Store 产品化
+
+P2 已完成验证，视为 100%。验证口径如下：
+
+- ✅ 核心元数据表已覆盖：`e_rag_knowledge_base`、`e_rag_file_set`、`e_rag_file`、`e_rag_chunk`。
+- ✅ 生产扩展表已覆盖：`e_rag_ingestion_job`、`e_rag_query_log`、`e_rag_tool_call_log`、`e_rag_usage_daily`、`e_rag_audit_log`、`e_rag_provider_health`。
+- ✅ SQL DDL 已落地：`sql/rag_named_knowledge_base.sql` 与 `sql/rag_production_metadata_extensions.sql`。
+- ✅ ORM 模型已落地：`app/database.py` 中存在全部对应 `ERag*` 模型。
+- ✅ MySQL 持久化 Store 已落地：`app/services/rag/mysql_store.py` 覆盖知识库、fileSet、file、chunk、ingestion job、query log、tool call log、usage、audit、provider health 等写入与查询能力。
+- ✅ `knowledgeBaseName` 唯一性已按 `tenant_id + owner_id + name + is_delete` 作用域约束。
+- ✅ chunk 与 vector point 可追踪：chunk 记录包含 `vector_provider`、`vector_collection`、`vector_namespace`、`vector_id`、embedding provider/model/dimension 等字段。
+- ✅ 生产路径已接入 MySQL：ingestion 过程会持久化 fileSet、file、chunk、job 状态；query/tool/usage 观测数据也可写入 MySQL。
+- ✅ SQLite snapshot 定位为本地/开发 fallback；生产配置 `RAG_DB_DSN` 后以 MySQL 作为 RAG metadata 单点真值。
+
+### P3：异步入库队列 TODO
+
+- [ ] 引入外部任务队列，替代仅依赖 FastAPI `BackgroundTasks` 的进程内执行模式。
+  - 候选：Celery、ARQ、Dramatiq 或其他兼容当前部署形态的队列。
+- [ ] 拆分 Web API 与 Worker 进程。
+  - Web API 只负责上传、创建 job、返回 `fileSetId` / `jobId`。
+  - Worker 负责 parse / chunk / embed / index / finalizing。
+- [ ] 实现任务持久化与服务重启恢复。
+  - API 或 Worker 重启后，pending/running job 可被重新发现并恢复处理。
+- [ ] 实现自动 retry 机制。
+  - 网络错误、Parser 5xx、Embedding 限流、Qdrant 临时不可用等可重试错误应指数退避重试。
+  - 文件格式不支持、内容为空、向量维度不匹配等不可重试错误应直接失败并记录原因。
+- [ ] 完善 `retry_count` / `max_retries` / `error_code` / `error_message` 更新逻辑。
+- [ ] 实现 cancel 语义的 Worker 侧中断检查。
+  - 长任务每个阶段开始前检查 job 是否已取消。
+- [ ] 支持 `partial_ready` 的稳定语义。
+  - 批量文件中部分文件失败时，成功文件可查询、可检索、可引用。
+- [ ] 增加队列并发控制。
+  - 按 tenant / owner / api_key 维度限制并发 ingestion 数。
+- [ ] 增加死信队列或失败任务归档。
+  - 超过最大重试次数后进入 failed/dead-letter 状态，便于人工排查。
+- [ ] 补齐 job 查询、retry、cancel 的端到端测试。
+
+### P4：权限、审计、计费 TODO
+
+- [ ] 从认证上下文统一派生 `tenant_id` / `owner_id` / `api_key_id`。
+  - 禁止信任客户端 metadata 中传入的租户、owner、API Key 标识。
+- [ ] 抽象 RAG Auth / Scope Builder。
+  - 将当前 header/request 解析逻辑收敛为独立组件，供上传、查询、Admin API、Worker 复用。
+- [ ] 所有查询强制应用 source scope。
+  - 包括 knowledge base、file set、chunk、vector payload filter、MySQL metadata filter。
+- [ ] 增加越权访问测试。
+  - 覆盖跨 tenant、跨 owner、跨 api_key、删除资源、临时 fileSet 过期等场景。
+- [ ] 完善 audit log 写入。
+  - 创建/删除/重命名知识库、上传文件、重试任务、取消任务、清理数据、重建索引、Admin 操作均写入 `e_rag_audit_log`。
+- [ ] 完善 query log / tool call log。
+  - 确保 query_id 能串联用户请求、MCP tool calls、retrieval 结果、citations、usage。
+- [ ] 完善 usage daily 聚合。
+  - 上传文件数、上传字节数、解析页数、chunk 数、embedding tokens、query 数、retrieval 数、prompt/completion tokens、storage bytes。
+- [ ] 实现配额校验。
+  - 单租户最大知识库数、单知识库文件数、单文件大小、每日上传量、每日 query 数、embedding token 限额、并发限制。
+- [ ] 补齐 Admin API。
+  - provider-info、stats、jobs、health、query-logs、audit-logs、usage、cleanup、orphan-cleanup、rebuild-index。
+- [ ] 为 Admin API 增加权限保护。
+  - 区分普通调用方与管理员角色；禁止普通 API Key 访问全局统计与跨租户数据。
+- [ ] 增加用量查询 API。
+  - 支持按 tenant / owner / api_key / date range 查询用量。
+- [ ] 增加 P4 回归测试。
+  - 覆盖权限隔离、日志落库、usage 聚合、Admin API 权限控制。
 
 ### Skills 管理
 
@@ -463,12 +531,13 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 | `ANTHROPIC_BASE_URL` | API Base URL | - | 否 |
 | `ANTHROPIC_MODEL` | 使用的模型 | `claude-sonnet-4-20250514` | 否 |
 | `AGENT_SDK_API_KEY` | 服务 API 认证密钥 | - | 否 |
+| `AGENT_SDK_FIRST_OUTPUT_TIMEOUT_MS` | 流式首包超时参考（毫秒），通过 `GET /config` 暴露给前端；服务端不主动掐断 | `30000` | 否 |
 | `AGENT_SDK_STREAM_RESULT_MODE` | result 输出：`full` / `empty` / `none` | `full` | 否 |
 | `AGENT_SDK_STREAM_EVENT_MODE` | 事件输出：`full` / `text_only` | `full` | 否 |
 | `AGENT_SDK_ADDITIONAL_SETTINGS_JSON` | 注入 `claude --settings` 的 JSON | `{"skipWebFetchPreflight":true}` | 否 |
 | `AGENT_SDK_PERMISSIONS_ALLOW` | `permissions.allow` 规则（逗号分隔） | - | 否 |
 | `AGENT_SDK_MCP_SERVERS_JSON` | 注入外部 MCP servers（JSON） | - | 否 |
-| `HOST` / `PORT` | 监听地址与端口 | `0.0.0.0` / `8000` | 否 |
+| `HOST` / `PORT` | 服务地址约定（文档/部署对齐用）；实际监听以 uvicorn `--host` / `--port` 为准 | `0.0.0.0` / `8000` | 否 |
 | `WORK_DIR` | Agent 工作目录 | 项目根目录 | 否 |
 | `SKILLS_DIR` | Skills 目录 | `./.claude/skills` | 否 |
 | `GLOBAL_DISALLOWED_TOOLS` | 全局禁用工具；空字符串表示全部放开 | `Write,Bash` | 否 |
@@ -894,7 +963,7 @@ pip install -r requirements.txt
 cp .env.example .env
 vim .env   # 填写必填项
 
-# 3. 启动服务（生产建议去掉 --reload）
+# 3. 启动服务（生产建议去掉 --reload；--port 与 .env 中 PORT 保持一致）
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # 或后台运行
@@ -1038,14 +1107,16 @@ MIT
 ### 分支约定
 
 - **`main`**：稳定分支，**禁止直接在 `main` 上提交或推送功能改动**
-- **特性分支**（如 `rag`、`feature/xxx`）：在此开发、提交，经 Review 后合并到 `main`
+- **`rag`**：当前 RAG 相关长期开发分支，RAG 功能改动优先在此开发、提交、推送
+- **特性分支**（如 `feature/xxx`）：非 RAG 功能可从最新 `main` 或目标开发分支切出，经 Review 后合并到 `main`
+
+> 提醒：如果当前分支是 `main`，不要继续开发或提交；请先切换到 `rag` 或新建特性分支。Agent 发现用户在 `main` 上开发时，应主动提醒并建议切换分支。
 
 推荐流程：
 
 ```bash
 git checkout main && git pull
-git checkout -b feature/your-change
+git checkout rag && git pull
 # ... 开发与提交 ...
-git checkout main && git merge feature/your-change
-git push origin main
+git push origin rag
 ```

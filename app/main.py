@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
+from .openapi_auth import APP_DESCRIPTION, OPENAPI_TAGS, customize_openapi
 from .routers import agent_router, rag_router, skills_router
 from .routers.agent_sdk import router as agent_sdk_router
 from .services.skills import skills_manager
@@ -69,10 +70,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CC Agent SDK",
-    description="基于 Claude Agent SDK 的 Docker Agent 服务，支持 Skills + Sub Agents",
+    description=APP_DESCRIPTION,
     version=VERSION,
-    lifespan=lifespan
+    lifespan=lifespan,
+    openapi_tags=OPENAPI_TAGS,
 )
+
+customize_openapi(app)
 
 # CORS 配置
 app.add_middleware(
@@ -92,7 +96,7 @@ app.include_router(skills_router)      # Skills API
 
 @app.get("/", tags=["Root"])
 async def root():
-    """API 根路径"""
+    """API 根路径（无需鉴权）"""
     return {
         "name": "CC Agent SDK",
         "version": VERSION,
@@ -102,7 +106,7 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
-    """健康检查"""
+    """健康检查（无需鉴权）"""
     return HealthResponse(
         status="healthy",
         version=VERSION
@@ -111,7 +115,7 @@ async def health_check():
 
 @app.get("/config", tags=["Config"])
 async def get_config():
-    """获取当前配置（不含敏感信息）"""
+    """获取当前配置（不含敏感信息，无需鉴权）"""
     return {
         "model": settings.anthropic_model,
         "workDir": settings.work_dir,

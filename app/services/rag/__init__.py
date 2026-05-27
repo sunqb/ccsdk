@@ -41,7 +41,9 @@ from .retriever import RagRetriever, RetrievalTrace, rag_retriever
 from .state_store import SQLiteRagStateStore
 from .tool_executor import RagToolExecutor, rag_tool_executor
 from .tools import RagToolService, rag_tool_service
+from .qdrant_vector_store import QdrantVectorStore
 from .vector_store import LocalVectorStore, SearchResult, VectorStore
+from .vector_store_factory import get_vector_store, reset as reset_vector_store_factory
 
 __all__ = [
     "EmbeddingProvider",
@@ -51,6 +53,7 @@ __all__ = [
     "LocalHashEmbeddingProvider",
     "LocalVectorStore",
     "OpenAICompatibleEmbeddingProvider",
+    "QdrantVectorStore",
     "RAG_MCP_ALLOWED_TOOLS",
     "ParsedDocument",
     "RagChunk",
@@ -78,8 +81,10 @@ __all__ = [
     "build_request_context",
     "build_reranker",
     "evaluate_retrieval_cases",
+    "get_vector_store",
     "new_retrieval_trace",
     "set_mysql_store_for_ingestion",
+    "reset_vector_store_factory",
     "structured_abstention_answer",
     "create_rag_mcp_server",
     "rag_answer_verifier",

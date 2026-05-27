@@ -18,6 +18,7 @@ def _force_local_embedding():
     RAG_EMBEDDING_PROVIDER env var for the entire test session.
     """
     os.environ["RAG_EMBEDDING_PROVIDER"] = "local"
+    os.environ["RAG_VECTOR_PROVIDER"] = "local"
     os.environ.pop("RAG_EMBEDDING_BASE_URL", None)
     os.environ.pop("RAG_EMBEDDING_API_KEY", None)
     os.environ["RAG_EMBEDDING_MODEL"] = "local_hash"
@@ -30,10 +31,13 @@ def _force_local_embedding():
     settings.rag_embedding_model = "local_hash"
     settings.rag_embedding_base_url = None
     settings.rag_embedding_api_key = None
+    settings.rag_vector_provider = "local"
 
     # Reset the factory singleton so it rebuilds from the mutated settings.
     from app.services.rag.embedding_factory import get_embedder, reset
+    from app.services.rag.vector_store_factory import reset as reset_vector_store_factory
     reset()
+    reset_vector_store_factory()
     local_embedder = get_embedder()
 
     # Keep module-level service singletons aligned with the test embedder.

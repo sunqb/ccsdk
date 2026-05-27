@@ -163,6 +163,7 @@ class UploadFileResponse(BaseModel):
     """RAG 文件上传响应。"""
 
     file_set_id: str = Field(..., alias="fileSetId", description="文件集 ID")
+    job_id: str | None = Field(None, alias="jobId", description="入库任务 ID")
     status: RagFileStatus = Field(..., description="文件集索引状态")
     conversation_id: str | None = Field(None, alias="conversationId", description="会话 ID")
     files: list[RagFileInfo] = Field(default_factory=list, description="上传文件列表")
@@ -208,12 +209,32 @@ class RagFileSetStatusResponse(BaseModel):
     """RAG 文件集索引状态响应。"""
 
     file_set_id: str = Field(..., alias="fileSetId", description="文件集 ID")
+    job_id: str | None = Field(None, alias="jobId", description="入库任务 ID")
     status: RagFileStatus = Field(..., description="文件集索引状态")
     progress: int = Field(0, ge=0, le=100, description="索引进度百分比")
     indexed_chunks: int = Field(0, alias="indexedChunks", ge=0, description="已索引块数")
     total_chunks: int | None = Field(None, alias="totalChunks", ge=0, description="总块数")
     files: list[RagFileInfo] = Field(default_factory=list, description="文件状态列表")
     errors: list[str] = Field(default_factory=list, description="错误列表")
+
+    class Config:
+        populate_by_name = True
+
+
+class RagIngestionJobInfo(BaseModel):
+    """RAG 入库任务状态。"""
+
+    job_id: str = Field(..., alias="jobId", description="入库任务 ID")
+    file_set_id: str = Field(..., alias="fileSetId", description="文件集 ID")
+    knowledge_base_id: str | None = Field(None, alias="knowledgeBaseId", description="知识库 ID")
+    status: str = Field(..., description="任务状态")
+    stage: str | None = Field(None, description="当前阶段")
+    progress_percent: int = Field(0, alias="progressPercent", ge=0, le=100, description="进度百分比")
+    retry_count: int = Field(0, alias="retryCount", ge=0, description="当前重试次数")
+    max_retries: int = Field(0, alias="maxRetries", ge=0, description="最大重试次数")
+    error_code: str | None = Field(None, alias="errorCode", description="错误码")
+    error_message: str | None = Field(None, alias="errorMessage", description="错误信息")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="任务元数据")
 
     class Config:
         populate_by_name = True
