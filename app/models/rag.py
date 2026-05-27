@@ -267,6 +267,7 @@ class RagStreamRequest(BaseModel):
     base_url: str | None = Field(None, alias="baseURL", description="API Base URL")
     api_key: str | None = Field(None, alias="apiKey", description="API Key")
     cwd: str | None = Field(None, description="工作目录")
+    space_id: str | None = Field(None, alias="spaceId", description="用户/租户空间ID，未传 cwd 时自动使用 <WORK_DIR>/spaces/<space_id>/")
 
     class Config:
         populate_by_name = True

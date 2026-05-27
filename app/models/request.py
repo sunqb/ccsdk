@@ -95,6 +95,11 @@ class StreamRequest(BaseModel):
         None,
         description="工作目录"
     )
+    space_id: Optional[str] = Field(
+        None,
+        alias="spaceId",
+        description="用户/租户空间ID，未传 cwd 时自动使用 <WORK_DIR>/spaces/<space_id>/ 作为工作目录"
+    )
     result_mode: Optional[str] = Field(
         None,
         alias="resultMode",
@@ -174,6 +179,11 @@ class QueryRequest(BaseModel):
     cwd: Optional[str] = Field(
         None,
         description="工作目录"
+    )
+    space_id: Optional[str] = Field(
+        None,
+        alias="spaceId",
+        description="用户/租户空间ID，未传 cwd 时自动使用 <WORK_DIR>/spaces/<space_id>/ 作为工作目录"
     )
 
     class Config:

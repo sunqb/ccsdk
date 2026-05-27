@@ -116,6 +116,7 @@ class AgentService:
         disallowed_tools: list[str] | None = None,
         max_turns: int | None = None,
         cwd: str | None = None,
+        space_id: str | None = None,
         system_prompt: str | None = None,
         setting_sources: list[str] | None = None,
         model: str | None = None,
@@ -133,7 +134,8 @@ class AgentService:
             allowed_tools: 允许的工具列表
             disallowed_tools: 禁止的工具列表
             max_turns: 最大对话轮数
-            cwd: 工作目录
+            cwd: 工作目录（显式覆盖）
+            space_id: 用户/租户空间ID，未传 cwd 时自动使用 <WORK_DIR>/spaces/<space_id>/
             system_prompt: 系统提示词
             setting_sources: 设置来源
             model: 覆盖默认模型
@@ -145,10 +147,11 @@ class AgentService:
         """
         await self._ensure_initialized()
 
-        # 确定有效工作目录（优先级：请求传入 > 会话已有 > 按 conversationId 自动隔离）
-        # SESSION_ISOLATED_WORKDIR=true 时，未传 cwd 的会话自动使用 <WORK_DIR>/sessions/<conversationId>/
+        # 确定有效工作目录（优先级：cwd > space_id > SESSION_ISOLATED_WORKDIR > WORK_DIR）
         effective_cwd = cwd
-        if not effective_cwd and settings.session_isolated_workdir and conversation_id:
+        if not effective_cwd and space_id:
+            effective_cwd = str(Path(settings.work_dir) / "spaces" / space_id)
+        elif not effective_cwd and settings.session_isolated_workdir and conversation_id:
             effective_cwd = str(Path(settings.work_dir) / "sessions" / conversation_id)
 
         # 自动创建工作目录（前端传入或自动隔离路径均可能不存在）
@@ -693,6 +696,7 @@ class AgentService:
         disallowed_tools: list[str] | None = None,
         max_turns: int | None = None,
         cwd: str | None = None,
+        space_id: str | None = None,
         system_prompt: str | None = None,
         setting_sources: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -713,6 +717,7 @@ class AgentService:
             disallowed_tools=disallowed_tools,
             max_turns=max_turns,
             cwd=cwd,
+            space_id=space_id,
             system_prompt=system_prompt,
             setting_sources=setting_sources
         ):

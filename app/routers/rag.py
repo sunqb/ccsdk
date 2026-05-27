@@ -456,6 +456,7 @@ async def _generate_rag_stream(
         system_prompt=RAG_SYSTEM_PROMPT,
         allowed_tools=RAG_MCP_ALLOWED_TOOLS,
         cwd=request.cwd,
+        space_id=request.space_id,
     ):
         yield event
 
@@ -533,6 +534,7 @@ async def _generate_rag_agent_stream(
             system_prompt=RAG_AGENT_TOOL_SYSTEM_PROMPT,
             allowed_tools=[],
             cwd=request.cwd or settings.work_dir,
+            space_id=request.space_id,
             on_complete=_record_stream_complete,
         ):
             yield event
@@ -1058,6 +1060,7 @@ async def rag_query(request: RagStreamRequest, http_request: Request) -> RagAnsw
             max_turns=request.options.max_turns,
             system_prompt=RAG_SYSTEM_PROMPT,
             cwd=request.cwd,
+            space_id=request.space_id,
             model=request.model,
             base_url=request.base_url,
             api_key=request.api_key,

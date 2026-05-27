@@ -70,6 +70,7 @@ class RagAgentRunner:
         system_prompt: str,
         allowed_tools: list[str] | None = None,
         cwd: str | None = None,
+        space_id: str | None = None,
         on_complete: Callable[[dict[str, Any], RecordingRagToolService], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Primary path: Claude Agent SDK + request-scoped in-process RAG MCP tools.
@@ -90,6 +91,7 @@ class RagAgentRunner:
                 max_turns=request.options.max_turns,
                 system_prompt=system_prompt,
                 cwd=cwd or request.cwd,
+                space_id=space_id or request.space_id,
                 model=request.model,
                 base_url=request.base_url,
                 api_key=request.api_key,
