@@ -21,6 +21,7 @@ dependencies = [
     "python-multipart>=0.0.29",
     "sqlalchemy[asyncio]>=2.0.0",
     "asyncmy>=0.2.9",
+    "opentelemetry-api>=1.42.1",
 ]
 
 [project.optional-dependencies]
