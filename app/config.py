@@ -18,8 +18,11 @@ def _secret_status(value: str | None) -> str:
     return f"set(len={len(value)})"
 
 
-def _env_bool(name: str, default: str = "") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+def _env_bool(name: str, default: str | bool = "") -> bool:
+    value = os.getenv(name)
+    if value is None:
+        value = str(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _default_work_dir() -> str:
@@ -289,6 +292,138 @@ class Settings:
     # 前端也可以直接在请求里传 cwd 覆盖此行为
     session_isolated_workdir: bool = field(
         default_factory=lambda: _env_bool("SESSION_ISOLATED_WORKDIR")
+    )
+
+    # WeChat Bot 配置
+    wechatbot_enabled: bool = field(
+        default_factory=lambda: _env_bool("WECHATBOT_ENABLED")
+    )
+    # 是否随主服务启动自动启动 Bot
+    wechatbot_auto_start: bool = field(
+        default_factory=lambda: _env_bool("WECHATBOT_AUTO_START", "false")
+    )
+    # 目标 SDK 配置（wechatbot.WeChatBot）
+    wechatbot_base_url: str = field(
+        default_factory=lambda: os.getenv("WECHATBOT_BASE_URL", "https://ilinkai.weixin.qq.com")
+    )
+    wechatbot_cred_path: str = field(
+        default_factory=lambda: os.getenv("WECHATBOT_CRED_PATH", "~/.wechatbot/credentials.json")
+    )
+    # WeChat iLink Bot 配置
+    wechatbot_ilink_app_id: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_ILINK_APP_ID")
+    )
+    wechatbot_ilink_app_secret: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_ILINK_APP_SECRET")
+    )
+    wechatbot_ilink_device_id: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_ILINK_DEVICE_ID")
+    )
+    # 凭证持久化目录（默认放在非公开目录）
+    wechatbot_credentials_dir: str = field(
+        default_factory=lambda: os.getenv(
+            "WECHATBOT_CREDENTIALS_DIR",
+            os.path.join(os.getenv("WORK_DIR", _default_work_dir()), ".wechatbot", "credentials")
+        )
+    )
+    # 消息回复分块大小（微信侧限制）
+    wechatbot_reply_chunk_size: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_REPLY_CHUNK_SIZE", "500"))
+    )
+    # 分块发送间隔，避免触发微信侧限流
+    wechatbot_reply_chunk_interval_seconds: float = field(
+        default_factory=lambda: float(os.getenv("WECHATBOT_REPLY_CHUNK_INTERVAL_SECONDS", "0.8"))
+    )
+    # 回复最大总字符数，超过会截断
+    wechatbot_max_reply_chars: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_MAX_REPLY_CHARS", "3500"))
+    )
+    # 全局并发消息处理数
+    wechatbot_max_concurrent_messages: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_MAX_CONCURRENT_MESSAGES", "3"))
+    )
+    # Agent/RAG 单条消息处理超时
+    wechatbot_message_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("WECHATBOT_MESSAGE_TIMEOUT_SECONDS", "120"))
+    )
+    # 默认消息模式：agent / rag
+    wechatbot_default_mode: str = field(
+        default_factory=lambda: os.getenv("WECHATBOT_DEFAULT_MODE", "agent").strip().lower()
+    )
+    # 微信用户白名单，逗号分隔；为空表示不限制
+    wechatbot_allowed_user_ids: list[str] = field(
+        default_factory=lambda: _csv_list(os.getenv("WECHATBOT_ALLOWED_USER_IDS", ""))
+    )
+    # Agent 模式下的系统提示词
+    wechatbot_agent_system_prompt: str = field(
+        default_factory=lambda: os.getenv(
+            "WECHATBOT_AGENT_SYSTEM_PROMPT",
+            "你是一个智能助手，请根据用户的问题给出专业、准确的回答。"
+        )
+    )
+    # 默认 RAG scope（当用户未指定时使用）
+    wechatbot_default_rag_scope: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_DEFAULT_RAG_SCOPE")
+    )
+    wechatbot_default_knowledge_base_id: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_DEFAULT_KNOWLEDGE_BASE_ID")
+    )
+    wechatbot_default_knowledge_base_name: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_DEFAULT_KNOWLEDGE_BASE_NAME")
+    )
+    wechatbot_default_file_set_id: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_DEFAULT_FILE_SET_ID")
+    )
+    # 媒体处理策略：ignore（默认，忽略媒体）/ download（下载但不入库）
+    wechatbot_media_policy: str = field(
+        default_factory=lambda: os.getenv("WECHATBOT_MEDIA_POLICY", "ignore").strip().lower()
+    )
+    # 媒体下载大小上限（MB）
+    wechatbot_media_max_download_size_mb: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_MEDIA_MAX_DOWNLOAD_SIZE_MB", "20"))
+    )
+    # 消息队列大小（用于 SSE 回复聚合）
+    wechatbot_queue_size: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_QUEUE_SIZE", "100"))
+    )
+    # 单用户每分钟最大消息数（限流）
+    wechatbot_rate_limit_per_user: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_RATE_LIMIT_PER_USER", "20"))
+    )
+    # 单用户突发最大消息数（burst limit）
+    wechatbot_rate_limit_burst: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_RATE_LIMIT_BURST", "5"))
+    )
+    # 限流窗口大小（秒）
+    wechatbot_rate_limit_window: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_RATE_LIMIT_WINDOW", "60"))
+    )
+    # OCR 服务端点（用于 summarize 策略）
+    wechatbot_ocr_endpoint: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_OCR_ENDPOINT")
+    )
+    # ASR 服务端点（用于 summarize 策略）
+    wechatbot_asr_endpoint: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_ASR_ENDPOINT")
+    )
+    # RAG 入库服务端点（用于 ingest 策略）
+    wechatbot_rag_ingest_endpoint: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_RAG_INGEST_ENDPOINT")
+    )
+    # 审计日志启用
+    wechatbot_audit_enabled: bool = field(
+        default_factory=lambda: _env_bool("WECHATBOT_AUDIT_ENABLED", default=False)
+    )
+    wechatbot_audit_log_content_preview: bool = field(
+        default_factory=lambda: _env_bool("WECHATBOT_AUDIT_LOG_CONTENT_PREVIEW", default=False)
+    )
+    # OpenTelemetry 启用
+    wechatbot_otel_enabled: bool = field(
+        default_factory=lambda: _env_bool("WECHATBOT_OTEL_ENABLED", default=False)
+    )
+    # OpenTelemetry OTLP 端点
+    wechatbot_otel_endpoint: str | None = field(
+        default_factory=lambda: os.getenv("WECHATBOT_OTEL_ENDPOINT")
     )
 
 

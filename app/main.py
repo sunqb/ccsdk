@@ -10,6 +10,7 @@ from .config import settings
 from .openapi_auth import APP_DESCRIPTION, OPENAPI_TAGS, customize_openapi
 from .routers import agent_router, rag_router, skills_router
 from .routers.agent_sdk import router as agent_sdk_router
+from .routers.wechatbot import router as wechatbot_router
 from .services.skills import skills_manager
 from .models.response import HealthResponse
 
@@ -56,9 +57,35 @@ async def lifespan(app: FastAPI):
     else:
         print("Warning: API Key authentication disabled (AGENT_SDK_API_KEY not set)")
 
+    # 启动 WeChatBot（如果启用）
+    if settings.wechatbot_enabled:
+        try:
+            from .services.wechatbot.manager import get_wechatbot_manager
+            manager = get_wechatbot_manager()
+            if settings.wechatbot_auto_start:
+                result = await manager.start()
+                print(f"[WeChatBot] WECHATBOT_AUTO_START=true，启动结果: {result.get('status')}")
+            else:
+                print("[WeChatBot] WECHATBOT_ENABLED=true，将在调用 /wechatbot/start 时启动 Bot")
+        except Exception as exc:
+            print(f"[WeChatBot WARNING] Failed to initialize: {exc}")
+    else:
+        print("[WeChatBot] WECHATBOT_ENABLED=false，跳过初始化")
+
     yield
 
     # 关闭时清理
+    # 停止 WeChatBot（如果正在运行）
+    if settings.wechatbot_enabled:
+        try:
+            from .services.wechatbot.manager import get_wechatbot_manager
+            manager = get_wechatbot_manager()
+            if manager.is_running:
+                await manager.stop()
+                print("[WeChatBot] Bot 已停止")
+        except Exception:
+            pass
+
     if settings.rag_db_dsn:
         try:
             from .database import close_rag_db
@@ -92,6 +119,7 @@ app.include_router(agent_sdk_router)  # 兼容原 cc-agent-sdk API
 app.include_router(agent_router)       # 简化版 API
 app.include_router(rag_router)         # RAG API
 app.include_router(skills_router)      # Skills API
+app.include_router(wechatbot_router)  # WeChatBot API
 
 
 @app.get("/", tags=["Root"])
