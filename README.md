@@ -33,6 +33,13 @@
 - ✅ **文档解析可配置**：`RAG_PARSER_PROVIDER=local` 本地解析，或 `mineru` 调用 MinerU 解析 PDF/DOCX（可配置回退）
 - ✅ **运维接口**：知识库 CRUD、索引状态、provider 信息、检索评测与过期清理
 
+### WeChatBot 微信入口
+
+- ✅ **Mode A：共享 Bot + 绑定码**：一个公共微信 Bot 服务多个 SaaS 用户，通过 `/bind` 绑定码映射到 `tenantId/appUserId`
+- ✅ **Mode B：每用户独立通道**：每个 SaaS 用户扫码登录自己的微信通道，独立凭证、独立 runtime、独立长轮询
+- ✅ **Agent / RAG 复用**：微信文本消息可进入普通 Agent 或 RAG 问答，继续继承工作区隔离、工具安全和限流策略
+- ✅ **管理 API**：提供 Bot 启停、二维码、绑定码、绑定列表、Mode B 通道启停与状态查询接口
+
 ## 快速开始
 
 ### 1. 克隆项目
@@ -157,7 +164,167 @@ curl -N -X POST http://localhost:8000/agent-sdk/rag/stream \
 | `/agent-sdk` | `routers/agent_sdk.py` | cc-agent-sdk 兼容入口；含 `/rag/stream` |
 | `/rag` | `routers/rag.py` | 文档上传、知识库、RAG 流式/非流式、运维 |
 | `/skills` | `routers/skills.py` | Skills CRUD |
+| `/wechatbot` | `routers/wechatbot.py` | 微信 Bot 对接；支持 Mode A 共享 Bot 与 Mode B 每用户独立通道 |
 | `/agent` | `routers/agent.py` | 简化版非兼容 API（`/query`、`/query/stream`） |
+
+## WeChatBot 对接
+
+WeChatBot 对接用于把微信 iLink Bot 私聊消息接入本项目现有 Agent / RAG / Skills 能力。当前支持两种并存模式：
+
+| 模式 | 适用场景 | 微信登录主体 | 是否需要 `/bind` | 凭证隔离 |
+|------|----------|--------------|------------------|----------|
+| Mode A | 一个官方/平台 Bot 服务多个 SaaS 用户 | 平台公共微信 Bot | 需要 | 单一 Bot 凭证 |
+| Mode B | 每个 SaaS 用户登录自己的微信通道 | 用户自己的微信号 | 不需要 | 每个 `tenantId + appUserId + botInstanceId` 独立凭证 |
+
+### 基础配置
+
+```env
+WECHATBOT_ENABLED=true
+WECHATBOT_AUTO_START=false
+WECHATBOT_BASE_URL=https://ilinkai.weixin.qq.com
+WECHATBOT_CRED_PATH=~/.wechatbot/credentials.json
+WECHATBOT_CREDENTIALS_DIR=<WORK_DIR>/.wechatbot/credentials
+WECHATBOT_DEFAULT_MODE=agent
+WECHATBOT_BOT_INSTANCE_ID=default
+
+# 生产推荐：使用 DB/composite 绑定，并要求未绑定用户先绑定
+WECHATBOT_BINDING_STORE=composite
+WECHATBOT_BIND_TOKEN_TTL_SECONDS=600
+WECHATBOT_REQUIRE_USER_TENANT=true
+```
+
+如果设置了 `AGENT_SDK_API_KEY`，以下管理 API 均需要请求头：
+
+```http
+X-API-Key: <your-api-key>
+```
+
+### Mode A：共享 Bot + 绑定码
+
+Mode A 使用一个公共微信 Bot。SaaS 用户需要先获取绑定码，然后在微信里给公共 Bot 发送 `/bind <code>` 完成绑定。
+
+#### 1. 启动公共 Bot
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/wechatbot/start
+```
+
+如果需要扫码，会返回：
+
+```json
+{
+  "status": "logging_in",
+  "message": "请扫码登录",
+  "qrcode_url": "https://..."
+}
+```
+
+也可以查询二维码：
+
+```bash
+curl -s http://127.0.0.1:8000/wechatbot/qrcode
+```
+
+#### 2. 为 SaaS 用户创建绑定码
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/wechatbot/bind-tokens \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenantId": "tenant-a",
+    "appUserId": "user-a",
+    "defaultMode": "agent",
+    "ttlSeconds": 600
+  }'
+```
+
+返回：
+
+```json
+{
+  "token": "WX-xxxxxx",
+  "expiresAt": "2026-05-29T10:10:00+00:00",
+  "bindCommand": "/bind WX-xxxxxx"
+}
+```
+
+把 `bindCommand` 展示给当前 SaaS 用户，让用户在微信里发送给公共 Bot。绑定成功后，后续消息会自动路由到对应的 `tenantId/appUserId`。
+
+#### 3. 查询和解绑
+
+```bash
+curl -s "http://127.0.0.1:8000/wechatbot/bindings?tenantId=tenant-a&appUserId=user-a"
+```
+
+```bash
+curl -s -X DELETE http://127.0.0.1:8000/wechatbot/bindings/1
+```
+
+### Mode B：每用户独立微信通道
+
+Mode B 不走 `/bind`。Web 后台为当前 SaaS 用户创建独立通道，用户扫码登录自己的微信后，该通道天然归属于创建时传入的 `tenantId/appUserId/botInstanceId`。
+
+#### 1. 启动用户独立通道
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/wechatbot/mode-b/channels/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenantId": "tenant-a",
+    "appUserId": "user-a",
+    "botInstanceId": "default",
+    "forceLogin": true
+  }'
+```
+
+首次需要扫码时返回：
+
+```json
+{
+  "status": "logging_in",
+  "message": "请扫码登录",
+  "qrcode_url": "https://..."
+}
+```
+
+如果本地凭证可复用或通道已运行，可能返回：
+
+```json
+{
+  "status": "running",
+  "message": "Bot 已经在运行中",
+  "qrcode_url": null
+}
+```
+
+#### 2. 查询用户独立通道状态
+
+```bash
+curl -s "http://127.0.0.1:8000/wechatbot/mode-b/channels/status?tenantId=tenant-a&appUserId=user-a&botInstanceId=default"
+```
+
+#### 3. 停止用户独立通道
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/wechatbot/mode-b/channels/stop \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenantId": "tenant-a",
+    "appUserId": "user-a",
+    "botInstanceId": "default"
+  }'
+```
+
+### 选择建议
+
+- 需要“一个官方机器人服务所有用户”：用 Mode A。
+- 需要“每个 SaaS 用户登录自己的微信通道”：用 Mode B。
+- 两套模式可以同时启用，但前端应明确区分“绑定公共 Bot”和“登录我的微信通道”。
+
+详细规格见：
+
+- [WeChatBot 对接规格说明](docs/specs/wechatbot-integration.md)
+- [WeChatBot Mode A SaaS 规格](docs/specs/wechatbot-mode-a-saas.md)
 
 ## Skills 使用方式
 
@@ -257,7 +424,7 @@ P2 已完成验证，视为 100%。验证口径如下：
 - ✅ `knowledgeBaseName` 唯一性已按 `tenant_id + owner_id + name + is_delete` 作用域约束。
 - ✅ chunk 与 vector point 可追踪：chunk 记录包含 `vector_provider`、`vector_collection`、`vector_namespace`、`vector_id`、embedding provider/model/dimension 等字段。
 - ✅ 生产路径已接入 MySQL：ingestion 过程会持久化 fileSet、file、chunk、job 状态；query/tool/usage 观测数据也可写入 MySQL。
-- ✅ SQLite snapshot 定位为本地/开发 fallback；生产配置 `RAG_DB_DSN` 后以 MySQL 作为 RAG metadata 单点真值。
+- ✅ SQLite snapshot 定位为本地/开发 fallback；生产配置 `DB_DSN` 后以 MySQL 作为 RAG metadata 单点真值。
 
 ### P3：异步入库队列 TODO
 

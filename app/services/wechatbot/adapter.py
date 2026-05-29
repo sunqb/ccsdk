@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 
 from app.config import settings
 
+from .tenant import resolve_tenant_context_async
+
 if TYPE_CHECKING:
     from .manager import WeChatBotManager
 
@@ -29,9 +31,10 @@ class WeChatBotAdapter:
     当 WECHATBOT_ENABLED=false 或 SDK 未安装时，提供友好的降级处理。
     """
 
-    def __init__(self):
+    def __init__(self, *, cred_path: str | None = None):
         self._bot = None
         self._manager = None
+        self._cred_path = cred_path
         self._sdk_available = False
         self._media_handler = None
         self._login_task: asyncio.Task | None = None
@@ -86,7 +89,7 @@ class WeChatBotAdapter:
 
             try:
                 qrcode_url = await asyncio.wait_for(self._qr_future, timeout=15.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # 如果本地已有有效凭证，login 可能不会产生二维码而是直接进入 start。
                 qrcode_url = None
 
@@ -120,7 +123,7 @@ class WeChatBotAdapter:
         """按目标 SDK README 的参数创建 Bot，兼容不同构造签名。"""
         kwargs = {
             "base_url": settings.wechatbot_base_url,
-            "cred_path": settings.wechatbot_cred_path,
+            "cred_path": self._cred_path or settings.wechatbot_cred_path,
             "on_qr_url": self._on_qr_url,
             "on_scanned": self._on_scanned,
             "on_expired": self._on_expired,
@@ -293,17 +296,41 @@ class WeChatBotAdapter:
 
         from .audit import get_audit_logger
         from .metrics import get_wechatbot_metrics
-        from .message_router import generate_conversation_id
 
         start_time = time.time()
         user_id_hash = hashlib.sha256(user_id.encode()).hexdigest()[:16]
-        conversation_id = generate_conversation_id(user_id)
 
         audit_logger = get_audit_logger()
         metrics = get_wechatbot_metrics()
         media_handler = self._get_media_handler()
 
+        allowed_user_ids = set(settings.wechatbot_allowed_user_ids)
+        if allowed_user_ids and user_id not in allowed_user_ids:
+            logger.warning("拒绝未授权微信媒体消息: user_hash=%s", user_id_hash)
+            if self.is_connected:
+                await self.send_message(user_id, "当前微信用户未被授权使用机器人。")
+            return
+
         # 检查是否为媒体消息
+        if not media_handler.is_media_message(message_type):
+            # 文本消息统一交给 manager 处理，确保未绑定用户仍可执行 /bind、/help、/me。
+            if self._manager:
+                response = await self._manager.handle_message(user_id, text)
+                if response and self.is_connected:
+                    await self.send_message(user_id, response)
+            return
+
+        tenant_context = await resolve_tenant_context_async(user_id)
+        if tenant_context is None:
+            if self.is_connected:
+                await self.send_message(user_id, "你还没有绑定系统账号。请先发送 /bind 绑定码。")
+            return
+
+        conversation_id = (
+            f"wechat:{tenant_context.tenant_id}:"
+            f"{tenant_context.bot_instance_id}:{tenant_context.user_id_hash}"
+        )
+
         if media_handler.is_media_message(message_type):
             # 构建媒体消息对象
             from .media_handler import MediaMessage
@@ -324,6 +351,8 @@ class WeChatBotAdapter:
                 conversation_id=conversation_id,
                 message_type=message_type,
                 file_name=media.file_name,
+                tenant_id=tenant_context.tenant_id,
+                app_user_id=tenant_context.app_user_id,
             )
 
             # 记录媒体消息指标
@@ -350,6 +379,8 @@ class WeChatBotAdapter:
                         conversation_id=conversation_id,
                         message_type=message_type,
                         reason="no_response",
+                        tenant_id=tenant_context.tenant_id,
+                        app_user_id=tenant_context.app_user_id,
                     )
 
             except Exception as e:
@@ -366,13 +397,6 @@ class WeChatBotAdapter:
 
                 if self.is_connected:
                     await self.send_message(user_id, f"处理{media_handler._get_type_name(message_type)}时出现错误，请稍后再试。")
-
-        else:
-            # 文本消息，交给 manager 处理
-            if self._manager:
-                response = await self._manager.handle_message(user_id, text)
-                if response and self.is_connected:
-                    await self.send_message(user_id, response)
 
     def _on_error(self, error) -> None:
         """错误回调"""

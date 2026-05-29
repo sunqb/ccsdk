@@ -2,7 +2,7 @@
 RAG MySQL 数据库模块。
 
 提供 SQLAlchemy 异步引擎、会话工厂和 ORM 模型定义。
-当 RAG_DB_DSN 配置时使用 MySQL；否则回退到 SQLite snapshot。
+当 DB_DSN 配置时使用 MySQL；否则回退到 SQLite snapshot。
 """
 from __future__ import annotations
 
@@ -449,7 +449,7 @@ async def init_rag_db() -> None:
     """初始化 RAG MySQL 引擎、会话工厂和表结构。"""
     global _engine, _session_factory
 
-    dsn = settings.rag_db_dsn
+    dsn = settings.db_dsn
     if not dsn:
         return
 

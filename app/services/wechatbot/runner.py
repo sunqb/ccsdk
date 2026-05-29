@@ -131,6 +131,7 @@ class MessageProcessor:
                 system_prompt=system_prompt,
                 allowed_tools=[],  # 微信入口不开放工具调用，避免远程触发写入/命令执行。
                 max_turns=10,
+                space_id=decision.space_id,
             ):
                 text = self._extract_text_from_event(event)
                 if text:
@@ -221,6 +222,7 @@ class MessageProcessor:
                 request_id=request_id,
                 system_prompt=system_prompt,
                 allowed_tools=[],  # 微信入口不开放工具调用。
+                space_id=decision.space_id,
             ):
                 # 解析 SSE 事件
                 event_data = self._parse_rag_sse_event(sse_event)

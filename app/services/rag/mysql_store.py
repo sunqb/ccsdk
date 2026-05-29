@@ -1,7 +1,7 @@
 """
 RAG MySQL 持久化存储。
 
-当 RAG_DB_DSN 配置时，知识库元数据写入 MySQL 结构化表；
+当 DB_DSN 配置时，知识库元数据写入 MySQL 结构化表；
 否则回退到 SQLite JSON snapshot。
 """
 from __future__ import annotations

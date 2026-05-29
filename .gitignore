@@ -116,6 +116,9 @@ dmypy.json
 # Project specific
 workspace/
 *.db
+*.sqlite
+*.sqlite3
+.wechatbot/
 
 # Data
 .claude/sessions.json

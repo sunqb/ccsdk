@@ -1,6 +1,7 @@
 """
 配置管理模块
 """
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,17 @@ def _default_work_dir() -> str:
 
 def _csv_list(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _env_json_dict(name: str) -> dict:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _default_rag_allowed_extensions() -> list[str]:
@@ -130,12 +142,9 @@ class Settings:
         default_factory=lambda: os.getenv("WORK_DIR", _default_work_dir())
     )
 
-    # RAG MySQL 数据库配置
+    # 全局 MySQL 数据库配置（RAG / WeChatBot / 后续 SaaS 元数据共用）
     # 格式：mysql+asyncmy://user:pass@host:port/dbname
-    # 为空时回退到 SQLite snapshot
-    rag_db_dsn: str = field(
-        default_factory=lambda: os.getenv("RAG_DB_DSN", "")
-    )
+    db_dsn: str = field(default_factory=lambda: os.getenv("DB_DSN", ""))
 
     # RAG MVP 配置
     rag_enabled: bool = field(
@@ -353,6 +362,29 @@ class Settings:
     # 微信用户白名单，逗号分隔；为空表示不限制
     wechatbot_allowed_user_ids: list[str] = field(
         default_factory=lambda: _csv_list(os.getenv("WECHATBOT_ALLOWED_USER_IDS", ""))
+    )
+    # Mode A SaaS：单 Bot 多用户/多租户配置
+    wechatbot_default_tenant_id: str = field(
+        default_factory=lambda: os.getenv("WECHATBOT_DEFAULT_TENANT_ID", "default").strip() or "default"
+    )
+    wechatbot_bot_instance_id: str = field(
+        default_factory=lambda: os.getenv("WECHATBOT_BOT_INSTANCE_ID", "default").strip() or "default"
+    )
+    wechatbot_require_user_tenant: bool = field(
+        default_factory=lambda: _env_bool("WECHATBOT_REQUIRE_USER_TENANT", "false")
+    )
+    # Mode A-2 自动绑定：db / env / composite
+    wechatbot_binding_store: str = field(
+        default_factory=lambda: os.getenv("WECHATBOT_BINDING_STORE", "composite").strip().lower()
+    )
+    wechatbot_bind_token_ttl_seconds: int = field(
+        default_factory=lambda: int(os.getenv("WECHATBOT_BIND_TOKEN_TTL_SECONDS", "600"))
+    )
+    wechatbot_user_tenant_map: dict = field(
+        default_factory=lambda: _env_json_dict("WECHATBOT_USER_TENANT_MAP")
+    )
+    wechatbot_tenant_rag_scope_map: dict = field(
+        default_factory=lambda: _env_json_dict("WECHATBOT_TENANT_RAG_SCOPE_MAP")
     )
     # Agent 模式下的系统提示词
     wechatbot_agent_system_prompt: str = field(

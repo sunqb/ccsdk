@@ -25,6 +25,9 @@ class RouteMode(str, Enum):
     AGENT = "agent"       # 普通 Agent 模式
     RAG = "rag"          # RAG 模式
     HELP = "help"        # 帮助
+    BIND = "bind"        # 绑定微信用户
+    UNBIND = "unbind"    # 解绑微信用户
+    ME = "me"            # 绑定状态
     RESET = "reset"      # 重置会话
     STATUS = "status"    # 状态查询
     UNSUPPORTED = "unsupported"  # 不支持的消息类型
@@ -37,6 +40,9 @@ class RouteDecision:
     message: str           # 解析后的纯消息（去掉命令前缀）
     conversation_id: str    # 用于 Agent/RAG 调用的会话 ID
     rag_scope: dict[str, str | list[str] | None] | None = None  # RAG 范围参数
+    tenant_id: str = "default"
+    app_user_id: str | None = None
+    space_id: str | None = None
 
 
 @dataclass
@@ -70,11 +76,15 @@ def parse_command(text: str) -> ParsedCommand:
     return ParsedCommand(command=command, args=args)
 
 
-def generate_conversation_id(user_id: str, bot_instance_id: str = "default") -> str:
+def generate_conversation_id(
+    user_id: str,
+    bot_instance_id: str = "default",
+    tenant_id: str = "default",
+) -> str:
     """
     生成微信用户的 conversationId
 
-    格式：wechat:{bot_instance_id}:{user_id_hash}
+    格式：wechat:{tenant_id}:{bot_instance_id}:{user_id_hash}
 
     Args:
         user_id: 微信用户 ID
@@ -85,13 +95,17 @@ def generate_conversation_id(user_id: str, bot_instance_id: str = "default") -> 
     """
     # 使用 SHA256 哈希 user_id，保护隐私
     user_id_hash = hashlib.sha256(user_id.encode()).hexdigest()[:16]
-    return f"wechat:{bot_instance_id}:{user_id_hash}"
+    return f"wechat:{tenant_id}:{bot_instance_id}:{user_id_hash}"
 
 
 def route_message(
     text: str,
     user_id: str,
     default_mode: RouteMode = RouteMode.AGENT,
+    tenant_id: str = "default",
+    bot_instance_id: str = "default",
+    app_user_id: str | None = None,
+    rag_scope: dict[str, str | list[str] | None] | None = None,
 ) -> RouteDecision:
     """
     路由微信消息
@@ -107,7 +121,19 @@ def route_message(
     text = text.strip()
 
     # 生成 conversationId
-    conversation_id = generate_conversation_id(user_id)
+    conversation_id = generate_conversation_id(user_id, bot_instance_id=bot_instance_id, tenant_id=tenant_id)
+    resolved_rag_scope = rag_scope if rag_scope is not None else build_default_rag_scope()
+
+    def decision(mode: RouteMode, message: str, scope: dict[str, str | list[str] | None] | None = None) -> RouteDecision:
+        return RouteDecision(
+            mode=mode,
+            message=message,
+            conversation_id=conversation_id,
+            rag_scope=scope,
+            tenant_id=tenant_id,
+            app_user_id=app_user_id,
+            space_id=tenant_id,
+        )
 
     # 解析命令
     parsed = parse_command(text)
@@ -115,85 +141,50 @@ def route_message(
     # 没有命令，使用默认模式
     if parsed.command is None:
         if default_mode == RouteMode.RAG:
-            # RAG 模式需要 scope
-            rag_scope = _build_rag_scope()
-            return RouteDecision(
-                mode=RouteMode.RAG,
-                message=parsed.args,
-                conversation_id=conversation_id,
-                rag_scope=rag_scope,
-            )
+            return decision(RouteMode.RAG, parsed.args, resolved_rag_scope)
         else:
-            return RouteDecision(
-                mode=RouteMode.AGENT,
-                message=parsed.args,
-                conversation_id=conversation_id,
-            )
+            return decision(RouteMode.AGENT, parsed.args)
 
     # 根据命令路由
     command = parsed.command.lstrip("/")  # 去掉可能的 / 前缀
 
     if command in ("help", "h", "?"):
-        return RouteDecision(
-            mode=RouteMode.HELP,
-            message="",
-            conversation_id=conversation_id,
-        )
+        return decision(RouteMode.HELP, "")
+
+    elif command in ("bind",):
+        return decision(RouteMode.BIND, parsed.args)
+
+    elif command in ("unbind",):
+        return decision(RouteMode.UNBIND, "")
+
+    elif command in ("me",):
+        return decision(RouteMode.ME, "")
 
     elif command in ("chat", "c"):
         # 强制 Agent 模式
-        return RouteDecision(
-            mode=RouteMode.AGENT,
-            message=parsed.args,
-            conversation_id=conversation_id,
-        )
+        return decision(RouteMode.AGENT, parsed.args)
 
     elif command in ("rag", "r"):
-        # RAG 模式
-        rag_scope = _build_rag_scope()
-        return RouteDecision(
-            mode=RouteMode.RAG,
-            message=parsed.args,
-            conversation_id=conversation_id,
-            rag_scope=rag_scope,
-        )
+        return decision(RouteMode.RAG, parsed.args, resolved_rag_scope)
 
     elif command in ("reset", "reboot"):
         # 重置会话
-        return RouteDecision(
-            mode=RouteMode.RESET,
-            message="",
-            conversation_id=conversation_id,
-        )
+        return decision(RouteMode.RESET, "")
 
     elif command in ("status", "stat", "s"):
         # 状态查询
-        return RouteDecision(
-            mode=RouteMode.STATUS,
-            message="",
-            conversation_id=conversation_id,
-        )
+        return decision(RouteMode.STATUS, "")
 
     else:
         # 未知命令，作为普通消息处理
         logger.info(f"未知命令: {command}，作为普通消息处理")
         if default_mode == RouteMode.RAG:
-            rag_scope = _build_rag_scope()
-            return RouteDecision(
-                mode=RouteMode.RAG,
-                message=text,  # 使用原始文本
-                conversation_id=conversation_id,
-                rag_scope=rag_scope,
-            )
+            return decision(RouteMode.RAG, text, resolved_rag_scope)
         else:
-            return RouteDecision(
-                mode=RouteMode.AGENT,
-                message=text,
-                conversation_id=conversation_id,
-            )
+            return decision(RouteMode.AGENT, text)
 
 
-def _build_rag_scope() -> dict[str, str | list[str] | None]:
+def build_default_rag_scope() -> dict[str, str | list[str] | None]:
     """
     构建 RAG scope 配置
 
@@ -224,6 +215,11 @@ def _build_rag_scope() -> dict[str, str | list[str] | None]:
     return scope
 
 
+def _build_rag_scope() -> dict[str, str | list[str] | None]:
+    """Backward-compatible alias for existing callers."""
+    return build_default_rag_scope()
+
+
 def get_help_text() -> str:
     """
     获取帮助文本
@@ -236,6 +232,9 @@ def get_help_text() -> str:
 支持以下命令：
 
 /help - 显示帮助信息
+/bind <绑定码> - 绑定当前微信到系统账号
+/me - 查看当前绑定状态
+/unbind - 解除当前微信绑定
 /chat <问题> - 使用普通 Agent 模式回答
 /rag <问题> - 使用知识库问答模式
 /reset - 重置当前会话

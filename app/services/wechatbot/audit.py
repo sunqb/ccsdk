@@ -42,6 +42,8 @@ class AuditEntry:
     event_type: str = "message"  # message, media, command, error
     user_id_hash: str = ""       # 脱敏后的 user_id
     conversation_id: str = ""
+    tenant_id: str | None = None
+    app_user_id: str | None = None
     direction: MessageDirection = MessageDirection.INBOUND
     status: MessageStatus = MessageStatus.RECEIVED
     message_type: str = "text"   # text, image, voice, file, video
@@ -84,6 +86,8 @@ class AuditLogger:
         conversation_id: str,
         message_type: str,
         content: str,
+        tenant_id: str | None = None,
+        app_user_id: str | None = None,
     ) -> AuditEntry:
         """
         记录消息接收
@@ -104,6 +108,8 @@ class AuditLogger:
             event_type="message",
             user_id_hash=user_id_hash,
             conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            app_user_id=app_user_id,
             direction=MessageDirection.INBOUND,
             status=MessageStatus.RECEIVED,
             message_type=message_type,
@@ -119,6 +125,8 @@ class AuditLogger:
         conversation_id: str,
         message_type: str,
         file_name: str | None = None,
+        tenant_id: str | None = None,
+        app_user_id: str | None = None,
     ) -> AuditEntry:
         """
         记录媒体消息接收
@@ -139,6 +147,8 @@ class AuditLogger:
             event_type="media",
             user_id_hash=user_id_hash,
             conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            app_user_id=app_user_id,
             direction=MessageDirection.INBOUND,
             status=MessageStatus.RECEIVED,
             message_type=message_type,
@@ -199,6 +209,8 @@ class AuditLogger:
         user_id: str,
         conversation_id: str,
         message_type: str,
+        tenant_id: str | None = None,
+        app_user_id: str | None = None,
     ) -> AuditEntry:
         """
         记录限流
@@ -218,6 +230,8 @@ class AuditLogger:
             event_type="message",
             user_id_hash=user_id_hash,
             conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            app_user_id=app_user_id,
             direction=MessageDirection.INBOUND,
             status=MessageStatus.RATE_LIMITED,
             message_type=message_type,
@@ -233,6 +247,8 @@ class AuditLogger:
         conversation_id: str,
         message_type: str,
         reason: str,
+        tenant_id: str | None = None,
+        app_user_id: str | None = None,
     ) -> AuditEntry:
         """
         记录忽略的消息
@@ -253,12 +269,82 @@ class AuditLogger:
             event_type="message",
             user_id_hash=user_id_hash,
             conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            app_user_id=app_user_id,
             direction=MessageDirection.INBOUND,
             status=MessageStatus.IGNORED,
             message_type=message_type,
             error_message=reason,
         )
 
+        self._log_entry(entry)
+        return entry
+
+    def log_bind_token_created(
+        self,
+        *,
+        token_preview: str,
+        tenant_id: str,
+        app_user_id: str,
+        expires_at: str,
+    ) -> AuditEntry:
+        """记录绑定码创建事件；不记录明文 token。"""
+        entry = AuditEntry(
+            event_type="bind_token_created",
+            tenant_id=tenant_id,
+            app_user_id=app_user_id,
+            direction=MessageDirection.OUTBOUND,
+            status=MessageStatus.COMPLETED,
+            message_type="bind_token",
+            extra={"token_preview": token_preview, "expires_at": expires_at},
+        )
+        self._log_entry(entry)
+        return entry
+
+    def log_bind_success(self, *, user_id_hash: str, tenant_id: str, app_user_id: str) -> AuditEntry:
+        """记录微信绑定成功事件。"""
+        entry = AuditEntry(
+            event_type="bind_success",
+            user_id_hash=user_id_hash,
+            tenant_id=tenant_id,
+            app_user_id=app_user_id,
+            direction=MessageDirection.INBOUND,
+            status=MessageStatus.COMPLETED,
+            message_type="bind",
+        )
+        self._log_entry(entry)
+        return entry
+
+    def log_bind_failed(self, *, user_id_hash: str, reason: str) -> AuditEntry:
+        """记录微信绑定失败事件；不记录明文 token。"""
+        entry = AuditEntry(
+            event_type="bind_failed",
+            user_id_hash=user_id_hash,
+            direction=MessageDirection.INBOUND,
+            status=MessageStatus.FAILED,
+            message_type="bind",
+            error_message=reason[:200],
+        )
+        self._log_entry(entry)
+        return entry
+
+    def log_unbind(
+        self,
+        *,
+        user_id_hash: str,
+        tenant_id: str,
+        app_user_id: str | None = None,
+    ) -> AuditEntry:
+        """记录微信解绑事件。"""
+        entry = AuditEntry(
+            event_type="unbind",
+            user_id_hash=user_id_hash,
+            tenant_id=tenant_id,
+            app_user_id=app_user_id,
+            direction=MessageDirection.INBOUND,
+            status=MessageStatus.COMPLETED,
+            message_type="unbind",
+        )
         self._log_entry(entry)
         return entry
 

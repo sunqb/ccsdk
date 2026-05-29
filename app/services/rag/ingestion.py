@@ -80,7 +80,7 @@ class RagIngestionService:
     SQLite after successful state transitions so local file sets survive process
     restarts.
 
-    When MySQL is configured (RAG_DB_DSN), production metadata is persisted to
+    When MySQL is configured (DB_DSN), production metadata is persisted to
     structured MySQL tables. SQLite is not a production metadata source of truth.
     """
 

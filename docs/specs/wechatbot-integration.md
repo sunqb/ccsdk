@@ -643,6 +643,152 @@ class WeChatRouteDecision(BaseModel):
 
 本章节用于跨模型、跨会话、跨中断恢复记录实现进度。每次执行一个任务前，先阅读本章节；任务完成后，更新对应状态、实际变更文件、验证方式与遗留问题。
 
+## 17. 当前已实现对接模式：Mode A 与 Mode B
+
+截至当前实现，WeChatBot 对接已经支持两套并存模式：
+
+| 模式 | 定位 | 微信登录主体 | 用户身份解析 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| Mode A | 单 Bot 多用户/多租户 | 平台公共微信 Bot | `/bind` 绑定码或环境变量/DB 映射 | 一个官方机器人服务多个 SaaS 用户 |
+| Mode B | 每用户独立微信通道 | SaaS 用户自己的微信号 | 通道创建时固定 `tenantId + appUserId + botInstanceId` | 每个 SaaS 用户扫码登录自己的微信通道 |
+
+两套模式复用同一套 WeChatBot SDK adapter、消息路由、Agent/RAG runner、安全策略、限流和审计能力，但登录凭证和运行时组织方式不同。
+
+### 17.1 Mode A：共享 Bot + 绑定码
+
+Mode A 使用原有 `/wechatbot/*` 生命周期 API：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/wechatbot/start` | 启动公共 Bot 或发起扫码登录。 |
+| `GET` | `/wechatbot/qrcode` | 获取公共 Bot 当前登录二维码。 |
+| `GET` | `/wechatbot/login-qrcode` | 等价于 `/wechatbot/qrcode`。 |
+| `GET` | `/wechatbot/status` | 查询公共 Bot 状态。 |
+| `POST` | `/wechatbot/stop` | 停止公共 Bot。 |
+| `POST` | `/wechatbot/relogin` | 重新登录公共 Bot。 |
+| `POST` | `/wechatbot/bind-tokens` | 为 SaaS 用户创建一次性微信绑定码。 |
+| `GET` | `/wechatbot/bindings` | 查询绑定列表。 |
+| `DELETE` | `/wechatbot/bindings/{id}` | 禁用/解绑绑定。 |
+
+推荐流程：
+
+```text
+1. 平台启动公共 Bot：POST /wechatbot/start
+2. SaaS Web 后端为当前用户创建绑定码：POST /wechatbot/bind-tokens
+3. 用户在微信里给公共 Bot 发送：/bind WX-xxxxxx
+4. 后续消息按绑定关系路由到 tenant/app_user
+```
+
+创建绑定码请求示例：
+
+```json
+{
+  "tenantId": "tenant-a",
+  "appUserId": "user-a",
+  "defaultMode": "agent",
+  "ragScope": {"knowledgeBaseId": "kb-a"},
+  "ttlSeconds": 600
+}
+```
+
+返回中的 `bindCommand` 只应展示给当前登录 SaaS 用户，明文 token 只在创建响应中返回一次。
+
+### 17.2 Mode B：每用户独立微信通道
+
+Mode B 新增 `/wechatbot/mode-b/channels/*` API。每个通道由以下三元组唯一标识：
+
+```text
+tenantId + appUserId + botInstanceId
+```
+
+如果 `botInstanceId` 不传，则使用 `WECHATBOT_BOT_INSTANCE_ID`，通常为 `default`。
+
+Mode B 的运行时隔离策略：
+
+```text
+tenantId + appUserId + botInstanceId
+  -> 独立 credential 文件
+  -> 独立 WeChatBotManager
+  -> 独立 WeChatBotAdapter
+  -> 独立登录二维码/长轮询通道
+```
+
+独立凭证存储路径：
+
+```text
+<WECHATBOT_CREDENTIALS_DIR>/mode_b/<sha256-prefix>.json
+```
+
+Mode B API：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/wechatbot/mode-b/channels/start` | 启动或创建用户独立微信通道；首次返回该用户专属二维码。 |
+| `GET` | `/wechatbot/mode-b/channels/status` | 查询指定用户独立通道状态。 |
+| `POST` | `/wechatbot/mode-b/channels/stop` | 停止指定用户独立通道。 |
+
+启动请求：
+
+```json
+{
+  "tenantId": "tenant-a",
+  "appUserId": "user-a",
+  "botInstanceId": "default",
+  "forceLogin": true
+}
+```
+
+首次需要扫码时返回：
+
+```json
+{
+  "status": "logging_in",
+  "message": "请扫码登录",
+  "qrcode_url": "https://..."
+}
+```
+
+已有有效凭证或通道已运行时可能返回：
+
+```json
+{
+  "status": "running",
+  "message": "Bot 已经在运行中",
+  "qrcode_url": null
+}
+```
+
+Mode B 不需要 `/bind`。用户扫码登录自己的微信后，该通道收到的消息天然归属于创建通道时传入的 `tenantId/appUserId/botInstanceId`。
+
+### 17.3 生命周期清理
+
+FastAPI 关闭时会清理：
+
+1. 原 Mode A 单 Bot manager。
+2. Mode B channel manager 中所有已启动通道。
+
+### 17.4 验证记录
+
+已执行回归测试：
+
+```bash
+python -m pytest tests/test_wechatbot_mode_a.py
+```
+
+结果：
+
+```text
+10 passed
+```
+
+手工验证：
+
+- `/wechatbot/mode-b/channels/start` 可返回独立通道运行态或登录二维码。
+- OpenAPI 已包含：
+  - `/wechatbot/mode-b/channels/start`
+  - `/wechatbot/mode-b/channels/stop`
+  - `/wechatbot/mode-b/channels/status`
+
 ### 16.1 状态约定
 
 | 状态 | 含义 |
