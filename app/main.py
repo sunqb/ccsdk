@@ -1,10 +1,14 @@
 """
 CC Agent SDK - 基于 Claude Agent SDK 的 API 服务
 """
+import logging
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import settings
 from .openapi_auth import APP_DESCRIPTION, OPENAPI_TAGS, customize_openapi
@@ -12,16 +16,17 @@ from .routers import agent_router, rag_router, skills_router
 from .routers.agent_sdk import router as agent_sdk_router
 from .routers.wechatbot import router as wechatbot_router
 from .services.skills import skills_manager
-from .models.response import HealthResponse
+from .models.response import AjaxResult, HealthResponse
 
 VERSION = "1.0.0"
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 初始化 RAG MySQL 数据库
-    if settings.rag_db_dsn:
+    if settings.db_dsn:
         try:
             from .database import init_rag_db, is_mysql_available
             from .services.rag import rag_mysql_store, set_mysql_store_for_ingestion
@@ -83,10 +88,12 @@ async def lifespan(app: FastAPI):
             if manager.is_running:
                 await manager.stop()
                 print("[WeChatBot] Bot 已停止")
+            from .services.wechatbot.channel_manager import get_wechatbot_channel_manager
+            await get_wechatbot_channel_manager().stop_all()
         except Exception:
             pass
 
-    if settings.rag_db_dsn:
+    if settings.db_dsn:
         try:
             from .database import close_rag_db
             await close_rag_db()
@@ -113,6 +120,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _ajax_json_response(result: AjaxResult) -> JSONResponse:
+    """统一返回可解析的业务错误结构，避免前端因异常响应阻塞。"""
+    return JSONResponse(status_code=200, content=result.to_response_dict())
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """统一处理 HTTPException，例如参数缺失、未授权或路径不存在。"""
+    msg = exc.detail if isinstance(exc.detail, str) else "请求失败"
+    logger.warning(
+        "HTTP exception: path=%s status=%s detail=%s",
+        request.url.path,
+        exc.status_code,
+        exc.detail,
+    )
+    return _ajax_json_response(AjaxResult.fail_response(code=exc.status_code, msg=msg))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """统一处理请求体验证异常。"""
+    logger.warning("Validation exception: path=%s errors=%s", request.url.path, exc.errors())
+    return _ajax_json_response(
+        AjaxResult.fail_response(code=400, msg="请求参数错误", data=exc.errors())
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """兜底处理未捕获异常，返回友好的 AjaxResult 结构。"""
+    logger.exception("Unhandled exception: path=%s", request.url.path, exc_info=exc)
+    return _ajax_json_response(AjaxResult.fail_response(code=500, msg="服务异常，请稍后重试"))
 
 # 注册路由
 app.include_router(agent_sdk_router)  # 兼容原 cc-agent-sdk API

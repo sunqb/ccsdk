@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import settings
+from ..models.response import AjaxResult
 from .history import history_service
 from .session import Session, session_manager
 
@@ -39,6 +40,11 @@ def _is_sdk_control_channel_close_race(error_detail: str) -> bool:
         "ProcessTransport is not ready for writing" in error_detail
         and "CLIConnectionError" in error_detail
     )
+
+
+def _is_resume_session_not_found(error_detail: str) -> bool:
+    """Detect stale Claude Code resume IDs that no longer exist on disk."""
+    return "No conversation found with session ID" in error_detail
 
 
 @dataclass
@@ -205,16 +211,34 @@ class AgentService:
                     yield event
             else:
                 # SDK 不可用时的降级处理
+                error_result = AjaxResult.fail_response(
+                    code=500,
+                    msg="claude_agent_sdk 未安装，请先安装依赖",
+                )
                 yield AgentEvent(
                     type="error",
-                    data={"message": "claude_agent_sdk not installed. Please install: pip install claude-agent-sdk"},
+                    data=error_result.to_response_dict(),
+                    conversation_id=session.id
+                )
+                yield AgentEvent(
+                    type="stream_event",
+                    subtype="end",
+                    data=error_result.to_response_dict(),
                     conversation_id=session.id
                 )
 
         except Exception as e:
+            logger.exception("Agent query failed", exc_info=e)
+            error_result = AjaxResult.fail_response(code=500, msg="Agent 服务异常，请稍后重试")
             yield AgentEvent(
                 type="error",
-                data={"message": str(e)},
+                data=error_result.to_response_dict(),
+                conversation_id=session.id
+            )
+            yield AgentEvent(
+                type="stream_event",
+                subtype="end",
+                data=error_result.to_response_dict(),
                 conversation_id=session.id
             )
 
@@ -449,12 +473,14 @@ class AgentService:
             }
 
         # 如果有会话ID，先修复可能损坏的 .jsonl，再恢复
+        resume_id_used: str | None = None
         if session.metadata.get("resume_id"):
             resume_id = session.metadata["resume_id"]
             result = history_service.repair_session(resume_id)
             if result["repaired"]:
                 logger.warning(f"[resume] 修复损坏历史 resume_id={resume_id}, patched={result['patched_count']}")
             options.resume = resume_id
+            resume_id_used = resume_id
 
         # 最终调试日志：确认传给 query() 的 options
         logger.info(f"[FINAL] options.settings = {options.settings}")
@@ -656,14 +682,64 @@ class AgentService:
 
                 yield AgentEvent(
                     type="error",
-                    data={
-                        "message": "Claude Agent SDK control channel closed before MCP control response was written.",
-                        "code": "sdk_control_channel_close_race",
-                        "recoverable": True,
-                        "detail": error_detail,
-                    },
+                    data=AjaxResult.fail_response(
+                        code=500,
+                        msg="Agent 通道异常，请稍后重试",
+                        data={
+                            "errorCode": "sdk_control_channel_close_race",
+                            "recoverable": True,
+                        },
+                    ).to_response_dict(),
                     conversation_id=session.id,
                 )
+                yield AgentEvent(
+                    type="stream_event",
+                    subtype="end",
+                    data=AjaxResult.fail_response(
+                        code=500,
+                        msg="Agent 通道异常，请稍后重试",
+                        data={
+                            "errorCode": "sdk_control_channel_close_race",
+                            "recoverable": True,
+                        },
+                    ).to_response_dict(),
+                    conversation_id=session.id,
+                )
+                return
+
+            # Claude Code 的真实 session_id 由 CLI 存在本地历史目录中。本服务保存的是
+            # conversationId -> resume_id 映射；如果本地历史被清理、cwd/项目目录变化、或历史
+            # 文件未落盘，第二次请求 resume 会报 “No conversation found with session ID”。
+            # 这种情况不应让前端会话彻底不可用：清掉过期 resume_id，并用同一个
+            # conversationId 立即重试一次（上下文会丢失，但问答链路恢复）。
+            if (
+                resume_id_used
+                and _is_resume_session_not_found(error_detail)
+                and not streamed_any_text_delta
+                and not result_text
+            ):
+                await session_manager.update_session_metadata(session.id, {"resume_id": None})
+                logger.warning(
+                    "[_query_with_sdk] stale resume_id not found; cleared and retrying once. "
+                    "conversation_id=%s resume_id=%s",
+                    session.id,
+                    resume_id_used,
+                )
+                async for retry_event in self._query_with_sdk(
+                    prompt=prompt,
+                    session=session,
+                    allowed_tools=allowed_tools,
+                    disallowed_tools=disallowed_tools,
+                    max_turns=max_turns,
+                    system_prompt=system_prompt,
+                    setting_sources=setting_sources,
+                    model=model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    result_mode=result_mode,
+                    mcp_servers=mcp_servers,
+                ):
+                    yield retry_event
                 return
 
             # 历史会话损坏（工具调用中断导致 tool_calls 无对应 tool_result）时，
@@ -673,18 +749,33 @@ class AgentService:
                 old_resume_id = session.metadata["resume_id"]
                 await session_manager.update_session_metadata(session.id, {"resume_id": None})
                 logger.warning(f"[_query_with_sdk] 历史会话损坏，已清除 resume_id={old_resume_id}，下次请求将以新 session 继续")
+                error_result = AjaxResult.fail_response(
+                    code=409,
+                    msg="历史会话因上次中断损坏，已自动重置。请重新发送消息，对话可继续（历史上下文已丢失）。",
+                    data={"errorCode": "corrupted_session_reset"},
+                )
                 yield AgentEvent(
                     type="error",
-                    data={
-                        "message": "历史会话因上次中断损坏，已自动重置。请重新发送消息，对话可继续（历史上下文已丢失）。",
-                        "code": "corrupted_session_reset",
-                    },
+                    data=error_result.to_response_dict(),
+                    conversation_id=session.id
+                )
+                yield AgentEvent(
+                    type="stream_event",
+                    subtype="end",
+                    data=error_result.to_response_dict(),
                     conversation_id=session.id
                 )
             else:
+                error_result = AjaxResult.fail_response(code=500, msg="Agent 服务异常，请稍后重试")
                 yield AgentEvent(
                     type="error",
-                    data={"message": error_detail},
+                    data=error_result.to_response_dict(),
+                    conversation_id=session.id
+                )
+                yield AgentEvent(
+                    type="stream_event",
+                    subtype="end",
+                    data=error_result.to_response_dict(),
                     conversation_id=session.id
                 )
 

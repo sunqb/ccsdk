@@ -8,13 +8,16 @@ Agent SDK API 路由。
 
 其他 `/agent/*`、`/rag/agent/stream` 接口保留为 legacy / 开发测试入口。
 """
+import logging
+
 from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator, Optional
 
 from ..models.rag import RagStreamRequest
 from ..models.request import StreamRequest, HistoryRequest
-from ..services.agent import agent_service
+from ..models.response import AjaxResult
+from ..services.agent import AgentEvent, agent_service
 from ..services.history import history_service
 from ..services.session import session_manager
 from ..auth import verify_api_key
@@ -22,6 +25,7 @@ from ..config import settings
 from .rag import _auth_scope_from_request, _generate_rag_agent_stream
 
 router = APIRouter(prefix="/agent-sdk", tags=["Agent SDK"])
+logger = logging.getLogger(__name__)
 
 
 async def _generate_sse_stream(
@@ -40,7 +44,7 @@ async def _generate_sse_stream(
     result_mode: Optional[str] = None,
     event_mode: str = "full",
 ) -> AsyncGenerator[str, None]:
-    """生成 SSE 事件流"""
+    """生成 SSE 事件流；异常时推送标准 error/end，避免前端阻塞。"""
     # 新版 SDK 语义：[] 表示 Skills / 原生工具全开；非空列表为白名单限制。
     # 请求未传时由上层保持 None，进入 agent_service 后归一化为 []。
     tools = allowed_tools if allowed_tools is not None else []
@@ -49,32 +53,48 @@ async def _generate_sse_stream(
     if effective_event_mode not in ("full", "text_only"):
         effective_event_mode = "full"
 
-    async for event in agent_service.query_stream(
-        prompt=prompt,
-        conversation_id=conversation_id,
-        allowed_tools=tools,
-        disallowed_tools=disallowed_tools,
-        max_turns=max_turns,
-        system_prompt=system_prompt,
-        setting_sources=setting_sources,
-        cwd=cwd,
-        space_id=space_id,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        result_mode=result_mode,
-    ):
-        if effective_event_mode == "full":
-            yield event.to_sse()
-            continue
+    try:
+        async for event in agent_service.query_stream(
+            prompt=prompt,
+            conversation_id=conversation_id,
+            allowed_tools=tools,
+            disallowed_tools=disallowed_tools,
+            max_turns=max_turns,
+            system_prompt=system_prompt,
+            setting_sources=setting_sources,
+            cwd=cwd,
+            space_id=space_id,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            result_mode=result_mode,
+        ):
+            if effective_event_mode == "full":
+                yield event.to_sse()
+                continue
 
-        # text_only：仅输出 text_delta，并保留 end/error 作为结束与异常信号
-        if event.type == "content_block_delta" and event.subtype == "text_delta":
-            yield event.to_sse()
-        elif event.type == "stream_event" and event.subtype == "end":
-            yield event.to_sse()
-        elif event.type == "error":
-            yield event.to_sse()
+            # text_only：仅输出 text_delta，并保留 end/error 作为结束与异常信号
+            if event.type == "content_block_delta" and event.subtype == "text_delta":
+                yield event.to_sse()
+            elif event.type == "stream_event" and event.subtype == "end":
+                yield event.to_sse()
+            elif event.type == "error":
+                yield event.to_sse()
+    except Exception as exc:
+        logger.exception("Agent SDK stream failed", exc_info=exc)
+        error_result = AjaxResult.fail_response(code=500, msg="Agent 服务异常，请稍后重试")
+        payload = error_result.to_response_dict()
+        yield AgentEvent(
+            type="error",
+            data=payload,
+            conversation_id=conversation_id,
+        ).to_sse()
+        yield AgentEvent(
+            type="stream_event",
+            subtype="end",
+            data=payload,
+            conversation_id=conversation_id,
+        ).to_sse()
 
 
 @router.post("/stream", dependencies=[Depends(verify_api_key)])
