@@ -71,10 +71,136 @@ ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
 监听端口由 **uvicorn 命令行** `--host` / `--port` 决定（与 `.env` 中 `HOST` / `PORT` 保持一致即可；当前进程不会自动读取 `PORT` 绑定端口）。
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+source .venv/bin/activate
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 5. 测试 API
+也可以直接指定项目 `.venv` 里的 Python，避免误用 pyenv 全局环境：
+
+```bash
+.venv/bin/python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+> 注意：本项目本地运行必须使用项目根目录下的 `.venv`。如果未激活 `.venv`，直接使用 pyenv 全局 Python 启动，可能会加载到错误版本的 `claude-agent-sdk`，导致 Claude Code CLI 子进程异常退出。
+
+可用以下命令确认当前 Python 与 SDK 是否来自项目 `.venv`：
+
+```bash
+which python
+python -c "import claude_agent_sdk, importlib.metadata as m; print('sdk file:', claude_agent_sdk.__file__); print('sdk version:', m.version('claude-agent-sdk'))"
+```
+
+正确情况下，路径应指向项目目录，例如：
+
+```text
+/Volumes/samsungssd/code/temp/ccsdk/.venv/bin/python
+/Volumes/samsungssd/code/temp/ccsdk/.venv/lib/python3.11/site-packages/claude_agent_sdk/...
+```
+
+如果日志中出现类似下面的路径，说明当前使用的是 pyenv 全局环境，不是项目 `.venv`：
+
+```text
+Using bundled Claude Code CLI:
+/Users/sunqb/.pyenv/versions/3.11.6/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude
+```
+
+这种情况下可能出现如下错误，尤其是在调用复杂 Skills（图片、视频、TTS、FFmpeg 等流程）时：
+
+```text
+Fatal error in message reader: Command failed with exit code 1
+Error output: Check stderr output for details
+```
+
+简单区分：`pyenv` 管 Python 解释器版本，`.venv` 管当前项目的 pip 依赖版本。本项目遇到 `claude-agent-sdk` 版本问题时，优先检查是否已激活 `.venv`。
+
+### 5. 服务器部署启动
+
+服务器部署时同样建议固定使用项目 `.venv`，不要依赖系统 Python、pyenv 全局环境或 PATH 中的 `uvicorn`。生产环境通常不需要 `--reload`。
+
+假设项目部署目录为 `/opt/ccsdk`：
+
+```bash
+cd /opt/ccsdk
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -U pip
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+启动服务推荐直接指定 `.venv` 里的 Python：
+
+```bash
+/opt/ccsdk/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+如果使用 `systemd`，可以参考：
+
+```ini
+[Unit]
+Description=CC Agent SDK
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ccsdk
+EnvironmentFile=/opt/ccsdk/.env
+ExecStart=/opt/ccsdk/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+如果临时用 `nohup` 启动，也要指定 `.venv`：
+
+```bash
+cd /opt/ccsdk
+mkdir -p logs
+nohup .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > logs/app.log 2>&1 &
+```
+
+每次服务器更新代码或依赖后：
+
+```bash
+cd /opt/ccsdk
+git pull
+.venv/bin/python -m pip install -r requirements.txt
+sudo systemctl restart ccsdk
+```
+
+#### Docker 部署
+
+Docker 环境中容器本身已经提供隔离环境，通常不需要额外创建 `.venv`。使用项目内置 `Dockerfile` / `docker-compose.yml` 时：
+
+```bash
+docker compose up -d --build
+```
+
+查看日志：
+
+```bash
+docker compose logs -f cc-agent-sdk
+```
+
+重启服务：
+
+```bash
+docker compose restart cc-agent-sdk
+```
+
+Docker Compose 会读取 `.env` 中的环境变量，并将服务暴露到宿主机 `8000` 端口。当前容器启动命令为：
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+注意：Docker 场景的关键是不要混用宿主机 Python / pyenv；依赖版本以镜像构建时 `requirements.txt` 安装结果为准。如果调整了依赖版本，需要重新构建镜像：
+
+```bash
+docker compose up -d --build
+```
+
+### 6. 测试 API
 
 **Agent 流式（需配置 `AGENT_SDK_API_KEY` 时加 `-H "X-API-Key: ..."`）**
 
