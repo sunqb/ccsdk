@@ -688,6 +688,10 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 | `RAG_EMBEDDING_MODEL` | Embedding 模型名称，例如 `bge-m3:latest` | `text-embedding-3-small` |
 | `RAG_EMBEDDING_BASE_URL` | OpenAI-compatible embedding 服务地址，例如 `http://host:port/v1` | 空 |
 | `RAG_EMBEDDING_API_KEY` | Embedding 服务 API Key | 空 |
+| `RAG_RERANK_PROVIDER` | Rerank provider：`local_lexical` / `cross_encoder_http` | `local_lexical` |
+| `RAG_RERANK_BASE_URL` | Cross-encoder reranker 服务地址，例如 `http://host:port/v1` | 空 |
+| `RAG_RERANK_MODEL` | Reranker 模型名称，例如 `bge-reranker-v2-m3` | `bge-reranker-v2-m3` |
+| `RAG_RERANK_API_KEY` | Reranker 服务 API Key；为空则不发送 Authorization | 空 |
 | `RAG_PARSER_PROVIDER` | 解析：`local` / `mineru` | `local` |
 | `MINERU_*` | MinerU 地址、密钥、超时、回退 | 见 `.env.example` |
 | `RAG_ALLOWED_EXTENSIONS` | 允许上传扩展名 | `.txt,.md,.pdf,.docx` |
@@ -727,6 +731,58 @@ LocalVectorStore 做 cosine similarity 检索
 ```
 
 该组合适合开发验证和单机小规模测试。生产环境建议替换为 Qdrant、Milvus、pgvector 等真实向量数据库。
+
+#### Cross-encoder reranker 与强制知识库检索
+
+RAG 支持在混合召回后接入 HTTP cross-encoder reranker，对候选 chunk 重新排序。当前 `cross_encoder_http` 适配的请求格式为：
+
+```http
+POST {RAG_RERANK_BASE_URL}/rerank
+```
+
+请求体：
+
+```json
+{
+  "model": "bge-reranker-v2-m3",
+  "query": "用户问题",
+  "documents": ["候选文档片段 1", "候选文档片段 2"],
+  "top_k": 8
+}
+```
+
+返回会读取 `results[].index` 与 `results[].relevance_score`。服务不可用或未配置 `RAG_RERANK_BASE_URL` 时，会回退到 `local_lexical`。
+
+```env
+RAG_RERANK_PROVIDER=cross_encoder_http
+RAG_RERANK_BASE_URL=http://zktz.4c888.com:62017/v1
+RAG_RERANK_MODEL=bge-reranker-v2-m3
+RAG_RERANK_API_KEY=
+```
+
+前端如果希望“用户选择知识库后必须先查知识库”，可以在 `options` 中显式传 `forceRetrieval=true`。后端不会因为选择了知识库而自动强制检索，是否强制由前端控制。
+
+```bash
+curl -N -X POST http://localhost:8000/agent-sdk/rag/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "介绍一下小兵张嘎",
+    "knowledgeBaseName": "zsk1",
+    "options": {
+      "forceRetrieval": true,
+      "hybrid": true,
+      "queryRewrite": true,
+      "multiQuery": true,
+      "retrieveTopK": 50,
+      "finalTopK": 8,
+      "rerank": true,
+      "rerankProvider": "cross_encoder_http",
+      "contextWindow": 1
+    }
+  }'
+```
+
+开启 `forceRetrieval` 后，服务端会先执行一次 RAG 检索并发送 `retrieval` SSE 事件，再把预取证据注入 Agent prompt。最终 `result` 中的 `citations`、`toolCalls` 与 `verification` 会包含这次强制预检索结果；Agent 仍可继续通过 RAG MCP 工具做二次查证。
 
 ## 项目结构
 
