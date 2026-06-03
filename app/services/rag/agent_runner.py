@@ -71,6 +71,9 @@ class RagAgentRunner:
         allowed_tools: list[str] | None = None,
         cwd: str | None = None,
         space_id: str | None = None,
+        prompt_override: str | None = None,
+        prefetched_results: list[SearchResult] | None = None,
+        prefetched_tool_calls: list[dict[str, Any]] | None = None,
         on_complete: Callable[[dict[str, Any], RecordingRagToolService], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Primary path: Claude Agent SDK + request-scoped in-process RAG MCP tools.
@@ -80,12 +83,16 @@ class RagAgentRunner:
         - 非空列表：仅允许列出的工具（如 ``/rag/stream`` 的 RAG MCP 四件套）
         """
         recording_service = RecordingRagToolService(self.tool_service)
+        if prefetched_results:
+            recording_service.search_results = prefetched_results
+        if prefetched_tool_calls:
+            recording_service.tool_calls.extend(prefetched_tool_calls)
         rag_mcp_server = create_rag_mcp_server(context, tool_service=recording_service)
         answer_parts: list[str] = []
 
         try:
             async for event in agent_service.query_stream(
-                prompt=request.message,
+                prompt=prompt_override or request.message,
                 conversation_id=request.conversation_id,
                 allowed_tools=allowed_tools,
                 max_turns=request.options.max_turns,

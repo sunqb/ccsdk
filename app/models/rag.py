@@ -56,6 +56,11 @@ class RagQueryOptions(BaseModel):
         description="进入回答的最终证据数量；默认兼容 topK",
     )
     hybrid: bool = Field(True, description="是否启用混合检索")
+    force_retrieval: bool = Field(
+        False,
+        alias="forceRetrieval",
+        description="是否由服务端强制先检索一次 RAG 资料，再将证据注入 Agent。",
+    )
     rerank: bool = Field(False, description="是否启用 rerank")
     rerank_provider: str | None = Field(
         None,

@@ -315,6 +315,38 @@ def _build_agent_tool_prefetch_prompt(message: str, sources: list[dict[str, Any]
     )
 
 
+async def _prefetch_forced_retrieval(
+    request: RagStreamRequest,
+    context: Any,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Run an explicit first retrieval when the frontend asks for forceRetrieval."""
+    started = perf_counter()
+    options = request.options
+    results = await rag_tool_service.hybrid_search(
+        query=request.message,
+        context=context,
+        top_k=options.top_k,
+        retrieve_top_k=options.retrieve_top_k,
+        final_top_k=options.final_top_k,
+        hybrid=options.hybrid,
+        query_rewrite=options.query_rewrite,
+        multi_query=options.multi_query,
+        rerank=options.rerank,
+        rerank_provider=options.rerank_provider,
+        context_window=options.context_window,
+    )
+    return results, [
+        {
+            "toolCallId": f"toolcall_{uuid4().hex}",
+            "name": "rag_hybrid_search",
+            "query": request.message,
+            "forced": True,
+            "resultCount": len(results),
+            "latencyMs": int((perf_counter() - started) * 1000),
+        }
+    ]
+
+
 def _extract_agent_delta(event: Any) -> str | None:
     if event.type == "content_block_delta" and event.subtype == "text_delta":
         data = event.data if isinstance(event.data, dict) else {}
@@ -449,6 +481,35 @@ async def _generate_rag_stream(
 
     context = build_request_context(request, request_id=request_id)
     active_runner = _active_rag_agent_runner()
+    prompt_override: str | None = None
+    prefetched_results: list[Any] | None = None
+    prefetched_tool_calls: list[dict[str, Any]] | None = None
+    if request.options.force_retrieval:
+        try:
+            prefetched_results, prefetched_tool_calls = await _prefetch_forced_retrieval(
+                request,
+                context,
+            )
+        except Exception as exc:  # noqa: BLE001
+            yield _sse_event(
+                "error",
+                {
+                    "code": "force_retrieval_failed",
+                    "message": str(exc),
+                    "requestId": request_id,
+                },
+            )
+            return
+        yield _sse_event(
+            "retrieval",
+            {
+                "requestId": request_id,
+                "forced": True,
+                "resultCount": len(prefetched_results),
+            },
+        )
+        prompt_override = _build_grounded_prompt(request.message, prefetched_results)
+
     async for event in active_runner.stream_claude_sdk(
         request=request,
         context=context,
@@ -457,6 +518,9 @@ async def _generate_rag_stream(
         allowed_tools=RAG_MCP_ALLOWED_TOOLS,
         cwd=request.cwd,
         space_id=request.space_id,
+        prompt_override=prompt_override,
+        prefetched_results=prefetched_results,
+        prefetched_tool_calls=prefetched_tool_calls,
     ):
         yield event
 
@@ -502,6 +566,38 @@ async def _generate_rag_agent_stream(
 
     context = build_request_context(request, request_id=request_id)
     active_runner = _active_rag_agent_runner()
+    prompt_override: str | None = None
+    prefetched_results: list[Any] | None = None
+    prefetched_tool_calls: list[dict[str, Any]] | None = None
+    if request.options.force_retrieval:
+        try:
+            prefetched_results, prefetched_tool_calls = await _prefetch_forced_retrieval(
+                request,
+                context,
+            )
+        except Exception as exc:  # noqa: BLE001
+            yield _sse_event(
+                "error",
+                {
+                    "code": "force_retrieval_failed",
+                    "message": str(exc),
+                    "requestId": request_id,
+                },
+            )
+            return
+        yield _sse_event(
+            "retrieval",
+            {
+                "requestId": request_id,
+                "forced": True,
+                "resultCount": len(prefetched_results),
+            },
+        )
+        prompt_override = _build_agent_tool_prefetch_prompt(
+            request.message,
+            [source.model_dump(by_alias=True) for source in request.get_sources()],
+            prefetched_results,
+        )
 
     async def _record_stream_complete(
         result_payload: dict[str, Any],
@@ -535,6 +631,9 @@ async def _generate_rag_agent_stream(
             allowed_tools=[],
             cwd=request.cwd or settings.work_dir,
             space_id=request.space_id,
+            prompt_override=prompt_override,
+            prefetched_results=prefetched_results,
+            prefetched_tool_calls=prefetched_tool_calls,
             on_complete=_record_stream_complete,
         ):
             yield event

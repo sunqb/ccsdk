@@ -73,6 +73,8 @@ class CrossEncoderHttpReranker:
 
     def __init__(self, base_url: str | None = None) -> None:
         self.base_url = (base_url or settings.rag_rerank_base_url or "").rstrip("/")
+        self.model = settings.rag_rerank_model or "bge-reranker-v2-m3"
+        self.api_key = settings.rag_rerank_api_key or ""
 
     async def rerank(
         self,
@@ -84,14 +86,20 @@ class CrossEncoderHttpReranker:
         if not self.base_url or not results:
             return await LocalLexicalReranker().rerank(query=query, results=results, top_k=top_k)
 
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 f"{self.base_url}/rerank",
                 json={
+                    "model": self.model,
                     "query": query,
                     "documents": [result.text for result in results],
-                    "topK": top_k,
+                    "top_k": top_k,
                 },
+                headers=headers,
             )
             response.raise_for_status()
             payload = response.json()
@@ -101,6 +109,7 @@ class CrossEncoderHttpReranker:
             return await LocalLexicalReranker().rerank(query=query, results=results, top_k=top_k)
 
         output: list[SearchResult] = []
+        used_indexes: set[int] = set()
         for item in ranked:
             if not isinstance(item, dict):
                 continue
@@ -108,7 +117,8 @@ class CrossEncoderHttpReranker:
             if not isinstance(index, int) or index < 0 or index >= len(results):
                 continue
             result = results[index]
-            score = float(item.get("score", result.score))
+            score = float(item.get("relevance_score", item.get("score", result.score)))
+            used_indexes.add(index)
             output.append(
                 SearchResult(
                     chunk_id=result.chunk_id,
@@ -116,11 +126,25 @@ class CrossEncoderHttpReranker:
                     chunk_index=result.chunk_index,
                     text=result.text,
                     score=score,
-                    metadata={**(result.metadata or {}), "rerankScore": score},
+                    metadata={
+                        **(result.metadata or {}),
+                        "rerankScore": score,
+                        "rerankProvider": "cross_encoder_http",
+                        "rerankModel": self.model,
+                    },
                     chunk=result.chunk,
                     search_type="rerank" if result.search_type != "context" else "context",
                 )
             )
+
+        if len(output) < top_k:
+            for index, result in enumerate(results):
+                if index in used_indexes:
+                    continue
+                output.append(result)
+                if len(output) >= top_k:
+                    break
+
         return output[:top_k] or await LocalLexicalReranker().rerank(
             query=query,
             results=results,
