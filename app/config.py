@@ -128,6 +128,13 @@ class Settings:
         default_factory=lambda: os.getenv("WORK_DIR", _default_work_dir())
     )
 
+    # RAG MySQL 数据库配置
+    # 格式：mysql+asyncmy://user:pass@host:port/dbname
+    # 为空时回退到 SQLite snapshot
+    rag_db_dsn: str = field(
+        default_factory=lambda: os.getenv("RAG_DB_DSN", "")
+    )
+
     # RAG MVP 配置
     rag_enabled: bool = field(
         default_factory=lambda: _env_bool("RAG_ENABLED")
@@ -183,6 +190,12 @@ class Settings:
     rag_rerank_base_url: str | None = field(
         default_factory=lambda: os.getenv("RAG_RERANK_BASE_URL")
     )
+    rag_rerank_model: str = field(
+        default_factory=lambda: os.getenv("RAG_RERANK_MODEL", "bge-reranker-v2-m3")
+    )
+    rag_rerank_api_key: str | None = field(
+        default_factory=lambda: os.getenv("RAG_RERANK_API_KEY")
+    )
     rag_verification_mode: str = field(
         default_factory=lambda: os.getenv("RAG_VERIFICATION_MODE", "standard").strip().lower()
     )
@@ -211,6 +224,16 @@ class Settings:
         default_factory=lambda: int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "16"))
     )
     rag_qdrant_url: str | None = field(default_factory=lambda: os.getenv("RAG_QDRANT_URL"))
+    rag_qdrant_api_key: str | None = field(default_factory=lambda: os.getenv("RAG_QDRANT_API_KEY"))
+    rag_qdrant_collection: str = field(
+        default_factory=lambda: os.getenv("RAG_QDRANT_COLLECTION", "rag_chunks")
+    )
+    rag_qdrant_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("RAG_QDRANT_TIMEOUT_SECONDS", "30"))
+    )
+    rag_qdrant_create_collection: bool = field(
+        default_factory=lambda: _env_bool("RAG_QDRANT_CREATE_COLLECTION", "true")
+    )
     rag_pgvector_dsn: str | None = field(default_factory=lambda: os.getenv("RAG_PGVECTOR_DSN"))
     rag_milvus_uri: str | None = field(default_factory=lambda: os.getenv("RAG_MILVUS_URI"))
 

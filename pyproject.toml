@@ -20,6 +20,9 @@ dependencies = [
     "python-docx>=1.2.0",
     "pypdf>=6.11.0",
     "python-multipart>=0.0.29",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "asyncmy>=0.2.9",
+    "opentelemetry-api>=1.42.1",
 ]
 
 [project.optional-dependencies]
@@ -54,4 +57,11 @@ testpaths = ["tests"]
 markers = [
     "integration: tests that require optional external services or real SDK setup",
     "rag_smoke: opt-in RAG Agent smoke tests gated by RUN_RAG_AGENT_SMOKE=1",
+]
+
+[dependency-groups]
+dev = [
+    "nest-asyncio>=1.6.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
 ]

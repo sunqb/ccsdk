@@ -88,11 +88,139 @@ ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
 
 ### 4. 启动服务
 
+监听端口由 **uvicorn 命令行** `--host` / `--port` 决定（与 `.env` 中 `HOST` / `PORT` 保持一致即可；当前进程不会自动读取 `PORT` 绑定端口）。
+
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+source .venv/bin/activate
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 5. 测试 API
+也可以直接指定项目 `.venv` 里的 Python，避免误用 pyenv 全局环境：
+
+```bash
+.venv/bin/python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+> 注意：本项目本地运行必须使用项目根目录下的 `.venv`。如果未激活 `.venv`，直接使用 pyenv 全局 Python 启动，可能会加载到错误版本的 `claude-agent-sdk`，导致 Claude Code CLI 子进程异常退出。
+
+可用以下命令确认当前 Python 与 SDK 是否来自项目 `.venv`：
+
+```bash
+which python
+python -c "import claude_agent_sdk, importlib.metadata as m; print('sdk file:', claude_agent_sdk.__file__); print('sdk version:', m.version('claude-agent-sdk'))"
+```
+
+正确情况下，路径应指向项目目录，例如：
+
+```text
+/Volumes/samsungssd/code/temp/ccsdk/.venv/bin/python
+/Volumes/samsungssd/code/temp/ccsdk/.venv/lib/python3.11/site-packages/claude_agent_sdk/...
+```
+
+如果日志中出现类似下面的路径，说明当前使用的是 pyenv 全局环境，不是项目 `.venv`：
+
+```text
+Using bundled Claude Code CLI:
+/Users/sunqb/.pyenv/versions/3.11.6/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude
+```
+
+这种情况下可能出现如下错误，尤其是在调用复杂 Skills（图片、视频、TTS、FFmpeg 等流程）时：
+
+```text
+Fatal error in message reader: Command failed with exit code 1
+Error output: Check stderr output for details
+```
+
+简单区分：`pyenv` 管 Python 解释器版本，`.venv` 管当前项目的 pip 依赖版本。本项目遇到 `claude-agent-sdk` 版本问题时，优先检查是否已激活 `.venv`。
+
+### 5. 服务器部署启动
+
+服务器部署时同样建议固定使用项目 `.venv`，不要依赖系统 Python、pyenv 全局环境或 PATH 中的 `uvicorn`。生产环境通常不需要 `--reload`。
+
+假设项目部署目录为 `/opt/ccsdk`：
+
+```bash
+cd /opt/ccsdk
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -U pip
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+启动服务推荐直接指定 `.venv` 里的 Python：
+
+```bash
+/opt/ccsdk/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+如果使用 `systemd`，可以参考：
+
+```ini
+[Unit]
+Description=CC Agent SDK
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ccsdk
+EnvironmentFile=/opt/ccsdk/.env
+ExecStart=/opt/ccsdk/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+如果临时用 `nohup` 启动，也要指定 `.venv`：
+
+```bash
+cd /opt/ccsdk
+mkdir -p logs
+nohup .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > logs/app.log 2>&1 &
+```
+
+每次服务器更新代码或依赖后：
+
+```bash
+cd /opt/ccsdk
+git pull
+.venv/bin/python -m pip install -r requirements.txt
+sudo systemctl restart ccsdk
+```
+
+#### Docker 部署
+
+Docker 环境中容器本身已经提供隔离环境，通常不需要额外创建 `.venv`。使用项目内置 `Dockerfile` / `docker-compose.yml` 时：
+
+```bash
+docker compose up -d --build
+```
+
+查看日志：
+
+```bash
+docker compose logs -f cc-agent-sdk
+```
+
+重启服务：
+
+```bash
+docker compose restart cc-agent-sdk
+```
+
+Docker Compose 会读取 `.env` 中的环境变量，并将服务暴露到宿主机 `8000` 端口。当前容器启动命令为：
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+注意：Docker 场景的关键是不要混用宿主机 Python / pyenv；依赖版本以镜像构建时 `requirements.txt` 安装结果为准。如果调整了依赖版本，需要重新构建镜像：
+
+```bash
+docker compose up -d --build
+```
+
+### 6. 测试 API
 
 **Agent 流式（需配置 `AGENT_SDK_API_KEY` 时加 `-H "X-API-Key: ..."`）**
 
@@ -621,6 +749,72 @@ curl -X POST http://localhost:8000/agent-sdk/stream \
 | POST | `/rag/admin/evaluate` | 检索评测 |
 | POST | `/rag/admin/cleanup` | 清理过期临时 fileSet |
 
+## RAG 产品化 TODO
+
+### P2：MySQL Metadata Store 产品化
+
+P2 已完成验证，视为 100%。验证口径如下：
+
+- ✅ 核心元数据表已覆盖：`e_rag_knowledge_base`、`e_rag_file_set`、`e_rag_file`、`e_rag_chunk`。
+- ✅ 生产扩展表已覆盖：`e_rag_ingestion_job`、`e_rag_query_log`、`e_rag_tool_call_log`、`e_rag_usage_daily`、`e_rag_audit_log`、`e_rag_provider_health`。
+- ✅ SQL DDL 已落地：`sql/rag_named_knowledge_base.sql` 与 `sql/rag_production_metadata_extensions.sql`。
+- ✅ ORM 模型已落地：`app/database.py` 中存在全部对应 `ERag*` 模型。
+- ✅ MySQL 持久化 Store 已落地：`app/services/rag/mysql_store.py` 覆盖知识库、fileSet、file、chunk、ingestion job、query log、tool call log、usage、audit、provider health 等写入与查询能力。
+- ✅ `knowledgeBaseName` 唯一性已按 `tenant_id + owner_id + name + is_delete` 作用域约束。
+- ✅ chunk 与 vector point 可追踪：chunk 记录包含 `vector_provider`、`vector_collection`、`vector_namespace`、`vector_id`、embedding provider/model/dimension 等字段。
+- ✅ 生产路径已接入 MySQL：ingestion 过程会持久化 fileSet、file、chunk、job 状态；query/tool/usage 观测数据也可写入 MySQL。
+- ✅ SQLite snapshot 定位为本地/开发 fallback；生产配置 `RAG_DB_DSN` 后以 MySQL 作为 RAG metadata 单点真值。
+
+### P3：异步入库队列 TODO
+
+- [ ] 引入外部任务队列，替代仅依赖 FastAPI `BackgroundTasks` 的进程内执行模式。
+  - 候选：Celery、ARQ、Dramatiq 或其他兼容当前部署形态的队列。
+- [ ] 拆分 Web API 与 Worker 进程。
+  - Web API 只负责上传、创建 job、返回 `fileSetId` / `jobId`。
+  - Worker 负责 parse / chunk / embed / index / finalizing。
+- [ ] 实现任务持久化与服务重启恢复。
+  - API 或 Worker 重启后，pending/running job 可被重新发现并恢复处理。
+- [ ] 实现自动 retry 机制。
+  - 网络错误、Parser 5xx、Embedding 限流、Qdrant 临时不可用等可重试错误应指数退避重试。
+  - 文件格式不支持、内容为空、向量维度不匹配等不可重试错误应直接失败并记录原因。
+- [ ] 完善 `retry_count` / `max_retries` / `error_code` / `error_message` 更新逻辑。
+- [ ] 实现 cancel 语义的 Worker 侧中断检查。
+  - 长任务每个阶段开始前检查 job 是否已取消。
+- [ ] 支持 `partial_ready` 的稳定语义。
+  - 批量文件中部分文件失败时，成功文件可查询、可检索、可引用。
+- [ ] 增加队列并发控制。
+  - 按 tenant / owner / api_key 维度限制并发 ingestion 数。
+- [ ] 增加死信队列或失败任务归档。
+  - 超过最大重试次数后进入 failed/dead-letter 状态，便于人工排查。
+- [ ] 补齐 job 查询、retry、cancel 的端到端测试。
+
+### P4：权限、审计、计费 TODO
+
+- [ ] 从认证上下文统一派生 `tenant_id` / `owner_id` / `api_key_id`。
+  - 禁止信任客户端 metadata 中传入的租户、owner、API Key 标识。
+- [ ] 抽象 RAG Auth / Scope Builder。
+  - 将当前 header/request 解析逻辑收敛为独立组件，供上传、查询、Admin API、Worker 复用。
+- [ ] 所有查询强制应用 source scope。
+  - 包括 knowledge base、file set、chunk、vector payload filter、MySQL metadata filter。
+- [ ] 增加越权访问测试。
+  - 覆盖跨 tenant、跨 owner、跨 api_key、删除资源、临时 fileSet 过期等场景。
+- [ ] 完善 audit log 写入。
+  - 创建/删除/重命名知识库、上传文件、重试任务、取消任务、清理数据、重建索引、Admin 操作均写入 `e_rag_audit_log`。
+- [ ] 完善 query log / tool call log。
+  - 确保 query_id 能串联用户请求、MCP tool calls、retrieval 结果、citations、usage。
+- [ ] 完善 usage daily 聚合。
+  - 上传文件数、上传字节数、解析页数、chunk 数、embedding tokens、query 数、retrieval 数、prompt/completion tokens、storage bytes。
+- [ ] 实现配额校验。
+  - 单租户最大知识库数、单知识库文件数、单文件大小、每日上传量、每日 query 数、embedding token 限额、并发限制。
+- [ ] 补齐 Admin API。
+  - provider-info、stats、jobs、health、query-logs、audit-logs、usage、cleanup、orphan-cleanup、rebuild-index。
+- [ ] 为 Admin API 增加权限保护。
+  - 区分普通调用方与管理员角色；禁止普通 API Key 访问全局统计与跨租户数据。
+- [ ] 增加用量查询 API。
+  - 支持按 tenant / owner / api_key / date range 查询用量。
+- [ ] 增加 P4 回归测试。
+  - 覆盖权限隔离、日志落库、usage 聚合、Admin API 权限控制。
+
 ### Skills 管理
 
 | 方法 | 端点 | 描述 |
@@ -876,12 +1070,13 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 | `ANTHROPIC_BASE_URL` | API Base URL | - | 否 |
 | `ANTHROPIC_MODEL` | 使用的模型 | `claude-sonnet-4-20250514` | 否 |
 | `AGENT_SDK_API_KEY` | 服务 API 认证密钥 | - | 否 |
+| `AGENT_SDK_FIRST_OUTPUT_TIMEOUT_MS` | 流式首包超时参考（毫秒），通过 `GET /config` 暴露给前端；服务端不主动掐断 | `30000` | 否 |
 | `AGENT_SDK_STREAM_RESULT_MODE` | result 输出：`full` / `empty` / `none` | `full` | 否 |
 | `AGENT_SDK_STREAM_EVENT_MODE` | 事件输出：`full` / `text_only` | `full` | 否 |
 | `AGENT_SDK_ADDITIONAL_SETTINGS_JSON` | 注入 `claude --settings` 的 JSON | `{"skipWebFetchPreflight":true}` | 否 |
 | `AGENT_SDK_PERMISSIONS_ALLOW` | `permissions.allow` 规则（逗号分隔） | - | 否 |
 | `AGENT_SDK_MCP_SERVERS_JSON` | 注入外部 MCP servers（JSON） | - | 否 |
-| `HOST` / `PORT` | 监听地址与端口 | `0.0.0.0` / `8000` | 否 |
+| `HOST` / `PORT` | 服务地址约定（文档/部署对齐用）；实际监听以 uvicorn `--host` / `--port` 为准 | `0.0.0.0` / `8000` | 否 |
 | `WORK_DIR` | Agent 工作目录 | 项目根目录 | 否 |
 | `SKILLS_DIR` | Skills 目录 | `./.claude/skills` | 否 |
 | `GLOBAL_DISALLOWED_TOOLS` | 全局强制禁用的工具，逗号分隔；设为空字符串可全部放开 | `Write,Bash` | 否 |
@@ -918,14 +1113,106 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 |--------|------|--------|
 | `RAG_ENABLED` | 是否启用 RAG | `false` |
 | `RAG_STORAGE_DIR` | 状态与向量快照目录 | `${WORK_DIR}/rag` |
-| `RAG_VECTOR_PROVIDER` | 向量库：`local`（可用）；qdrant/pgvector/milvus 预留 | `local` |
-| `RAG_EMBEDDING_PROVIDER` | Embedding：`openai_compatible` 等 | `openai_compatible` |
+| `RAG_VECTOR_PROVIDER` | 向量库 provider。当前真实可用：`local`；`qdrant` / `pgvector` / `milvus` 为预留 | `local` |
+| `RAG_EMBEDDING_PROVIDER` | Embedding provider。支持 `local` / `openai_compatible` | `openai_compatible` |
+| `RAG_EMBEDDING_MODEL` | Embedding 模型名称，例如 `bge-m3:latest` | `text-embedding-3-small` |
+| `RAG_EMBEDDING_BASE_URL` | OpenAI-compatible embedding 服务地址，例如 `http://host:port/v1` | 空 |
+| `RAG_EMBEDDING_API_KEY` | Embedding 服务 API Key | 空 |
+| `RAG_RERANK_PROVIDER` | Rerank provider：`local_lexical` / `cross_encoder_http` | `local_lexical` |
+| `RAG_RERANK_BASE_URL` | Cross-encoder reranker 服务地址，例如 `http://host:port/v1` | 空 |
+| `RAG_RERANK_MODEL` | Reranker 模型名称，例如 `bge-reranker-v2-m3` | `bge-reranker-v2-m3` |
+| `RAG_RERANK_API_KEY` | Reranker 服务 API Key；为空则不发送 Authorization | 空 |
 | `RAG_PARSER_PROVIDER` | 解析：`local` / `mineru` | `local` |
 | `MINERU_*` | MinerU 地址、密钥、超时、回退 | 见 `.env.example` |
 | `RAG_ALLOWED_EXTENSIONS` | 允许上传扩展名 | `.txt,.md,.pdf,.docx` |
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | 切分参数 | `1000` / `120` |
 | `RAG_MAX_CONCURRENT_INGESTIONS` | 入库并发上限 | `4` |
 | `RAG_MAX_CONCURRENT_QUERIES` | 查询并发上限 | `16` |
+
+#### BGE-M3 embedding + local vector store 示例
+
+开发环境可以使用远程 BGE-M3 作为 embedding 模型，同时继续使用本地 `LocalVectorStore` 作为向量存储：
+
+```env
+RAG_ENABLED=true
+
+# 向量库：本地开发/单机测试
+RAG_VECTOR_PROVIDER=local
+
+# Embedding：OpenAI-compatible BGE-M3
+RAG_EMBEDDING_PROVIDER=openai_compatible
+RAG_EMBEDDING_MODEL=bge-m3:latest
+RAG_EMBEDDING_BASE_URL=http://zktz.4c888.com:62011/v1
+RAG_EMBEDDING_API_KEY=<your-api-key>
+```
+
+链路如下：
+
+```text
+文档文本
+  ↓
+BGE-M3 生成 1024 维 embedding
+  ↓
+LocalVectorStore 保存 chunk + embedding
+  ↓
+查询文本通过同一 BGE-M3 生成 query embedding
+  ↓
+LocalVectorStore 做 cosine similarity 检索
+```
+
+该组合适合开发验证和单机小规模测试。生产环境建议替换为 Qdrant、Milvus、pgvector 等真实向量数据库。
+
+#### Cross-encoder reranker 与强制知识库检索
+
+RAG 支持在混合召回后接入 HTTP cross-encoder reranker，对候选 chunk 重新排序。当前 `cross_encoder_http` 适配的请求格式为：
+
+```http
+POST {RAG_RERANK_BASE_URL}/rerank
+```
+
+请求体：
+
+```json
+{
+  "model": "bge-reranker-v2-m3",
+  "query": "用户问题",
+  "documents": ["候选文档片段 1", "候选文档片段 2"],
+  "top_k": 8
+}
+```
+
+返回会读取 `results[].index` 与 `results[].relevance_score`。服务不可用或未配置 `RAG_RERANK_BASE_URL` 时，会回退到 `local_lexical`。
+
+```env
+RAG_RERANK_PROVIDER=cross_encoder_http
+RAG_RERANK_BASE_URL=http://zktz.4c888.com:62017/v1
+RAG_RERANK_MODEL=bge-reranker-v2-m3
+RAG_RERANK_API_KEY=
+```
+
+前端如果希望“用户选择知识库后必须先查知识库”，可以在 `options` 中显式传 `forceRetrieval=true`。后端不会因为选择了知识库而自动强制检索，是否强制由前端控制。
+
+```bash
+curl -N -X POST http://localhost:8000/agent-sdk/rag/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "介绍一下小兵张嘎",
+    "knowledgeBaseName": "zsk1",
+    "options": {
+      "forceRetrieval": true,
+      "hybrid": true,
+      "queryRewrite": true,
+      "multiQuery": true,
+      "retrieveTopK": 50,
+      "finalTopK": 8,
+      "rerank": true,
+      "rerankProvider": "cross_encoder_http",
+      "contextWindow": 1
+    }
+  }'
+```
+
+开启 `forceRetrieval` 后，服务端会先执行一次 RAG 检索并发送 `retrieval` SSE 事件，再把预取证据注入 Agent prompt。最终 `result` 中的 `citations`、`toolCalls` 与 `verification` 会包含这次强制预检索结果；Agent 仍可继续通过 RAG MCP 工具做二次查证。
 
 ## 项目结构
 
@@ -956,8 +1243,9 @@ ccsdk/
 │           ├── ingestion.py    # 上传入库
 │           ├── parser.py       # local / MinerU 文档解析
 │           ├── chunker.py      # 文本切分
-│           ├── embeddings.py   # Embedding provider
-│           ├── vector_store.py # 本地向量检索
+│           ├── embeddings.py          # Embedding provider 实现
+│           ├── embedding_factory.py   # Embedding 单点真值与健康检查
+│           ├── vector_store.py        # 本地向量检索与维度一致性防护
 │           ├── retriever.py    # 混合检索 + rerank
 │           ├── mcp.py          # in-process RAG MCP 四件套
 │           ├── agent_runner.py # RAG 流式编排（Claude SDK）
@@ -1304,7 +1592,7 @@ docker run --rm -v /data/ccsdk:/sandbox:rw ccsdk-sandbox:latest \
 cp .env.example .env
 vim .env   # 填写必填项
 
-# 5. 启动服务（生产建议去掉 --reload）
+# 5. 启动服务（生产建议去掉 --reload；--port 与 .env 中 PORT 保持一致）
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # 或后台运行
@@ -1503,14 +1791,16 @@ MIT
 ### 分支约定
 
 - **`main`**：稳定分支，**禁止直接在 `main` 上提交或推送功能改动**
-- **特性分支**（如 `rag`、`feature/xxx`）：在此开发、提交，经 Review 后合并到 `main`
+- **`rag`**：当前 RAG 相关长期开发分支，RAG 功能改动优先在此开发、提交、推送
+- **特性分支**（如 `feature/xxx`）：非 RAG 功能可从最新 `main` 或目标开发分支切出，经 Review 后合并到 `main`
+
+> 提醒：如果当前分支是 `main`，不要继续开发或提交；请先切换到 `rag` 或新建特性分支。Agent 发现用户在 `main` 上开发时，应主动提醒并建议切换分支。
 
 推荐流程：
 
 ```bash
 git checkout main && git pull
-git checkout -b feature/your-change
+git checkout rag && git pull
 # ... 开发与提交 ...
-git checkout main && git merge feature/your-change
-git push origin main
+git push origin rag
 ```

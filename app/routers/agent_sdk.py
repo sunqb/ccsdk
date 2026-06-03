@@ -8,7 +8,7 @@ Agent SDK API 路由。
 
 其他 `/agent/*`、`/rag/agent/stream` 接口保留为 legacy / 开发测试入口。
 """
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator, Optional
 
@@ -19,7 +19,7 @@ from ..services.history import history_service
 from ..services.session import session_manager
 from ..auth import verify_api_key
 from ..config import settings
-from .rag import _generate_rag_agent_stream
+from .rag import _auth_scope_from_request, _generate_rag_agent_stream
 
 router = APIRouter(prefix="/agent-sdk", tags=["Agent SDK"])
 
@@ -34,6 +34,7 @@ async def _generate_sse_stream(
     system_prompt: Optional[str],
     setting_sources: Optional[list[str]],
     cwd: Optional[str],
+    space_id: Optional[str],
     model: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -59,6 +60,7 @@ async def _generate_sse_stream(
         system_prompt=system_prompt,
         setting_sources=setting_sources,
         cwd=cwd,
+        space_id=space_id,
         model=model,
         base_url=base_url,
         api_key=api_key,
@@ -157,6 +159,7 @@ async def agent_sdk_stream(request: StreamRequest):
             system_prompt=system_prompt,
             setting_sources=request.setting_sources,
             cwd=request.cwd,
+            space_id=request.space_id,
             model=request.model,
             base_url=request.base_url,
             api_key=request.api_key,
@@ -173,7 +176,7 @@ async def agent_sdk_stream(request: StreamRequest):
 
 
 @router.post("/rag/stream", dependencies=[Depends(verify_api_key)])
-async def agent_sdk_rag_stream(request: RagStreamRequest):
+async def agent_sdk_rag_stream(http_request: Request, request: RagStreamRequest):
     """
     【正式前端入口】RAG + Agent SDK + Skills 流式问答。
 
@@ -197,8 +200,9 @@ async def agent_sdk_rag_stream(request: RagStreamRequest):
     as project Skills. The legacy `/rag/agent/stream` endpoint remains available
     for development and diagnostics.
     """
+    scope = _auth_scope_from_request(http_request)
     return StreamingResponse(
-        _generate_rag_agent_stream(request),
+        _generate_rag_agent_stream(request, scope=scope),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -29,6 +29,8 @@ def build_provider_info(
     *,
     active_provider: str,
     qdrant_url: str | None = None,
+    qdrant_collection: str | None = None,
+    qdrant_create_collection: bool | None = None,
     pgvector_dsn: str | None = None,
     milvus_uri: str | None = None,
 ) -> dict[str, object]:
@@ -43,10 +45,18 @@ def build_provider_info(
         },
         {
             "name": "qdrant",
-            "available": False,
+            "available": bool(qdrant_url),
             "configured": bool(qdrant_url),
             "active": active_provider == "qdrant",
-            "mode": "placeholder",
+            "mode": "external_vector_db",
+            "collection": qdrant_collection,
+            "createCollection": qdrant_create_collection,
+            "capabilities": {
+                "denseVectorSearch": True,
+                "payloadFilter": True,
+                "keywordSearch": "payload_scan_bm25",
+                "hybridSearch": "retriever_fusion",
+            },
         },
         {
             "name": "pgvector",

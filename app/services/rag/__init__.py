@@ -7,14 +7,24 @@ from .embeddings import (
     LocalHashEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
 )
+from .embedding_factory import (
+    EmbeddingProfile,
+    get_embedder,
+    get_embedding_profile,
+    health_check as embedding_health_check,
+    validate_dimension_compatibility,
+    reset as reset_embedding_factory,
+)
 from .ingestion import (
     FileSetRecord,
     IngestFile,
     KnowledgeBaseRecord,
     RagIngestionService,
     rag_ingestion_service,
+    set_mysql_store_for_ingestion,
 )
 from .mcp import RAG_MCP_ALLOWED_TOOLS, create_rag_mcp_server
+from .mysql_store import RagMySqlStore, rag_mysql_store
 from .parser import ParsedDocument, TextDocumentParser
 from .production import RagConcurrencyGuard, build_provider_info
 from .answer_verifier import RagAnswerVerifier, RagVerificationResult, rag_answer_verifier
@@ -31,7 +41,9 @@ from .retriever import RagRetriever, RetrievalTrace, rag_retriever
 from .state_store import SQLiteRagStateStore
 from .tool_executor import RagToolExecutor, rag_tool_executor
 from .tools import RagToolService, rag_tool_service
+from .qdrant_vector_store import QdrantVectorStore
 from .vector_store import LocalVectorStore, SearchResult, VectorStore
+from .vector_store_factory import get_vector_store, reset as reset_vector_store_factory
 
 __all__ = [
     "EmbeddingProvider",
@@ -41,6 +53,7 @@ __all__ = [
     "LocalHashEmbeddingProvider",
     "LocalVectorStore",
     "OpenAICompatibleEmbeddingProvider",
+    "QdrantVectorStore",
     "RAG_MCP_ALLOWED_TOOLS",
     "ParsedDocument",
     "RagChunk",
@@ -49,6 +62,7 @@ __all__ = [
     "RagAnswerVerifier",
     "RagConcurrencyGuard",
     "RagIngestionService",
+    "RagMySqlStore",
     "RagRetriever",
     "RagToolExecutor",
     "RagToolService",
@@ -67,12 +81,16 @@ __all__ = [
     "build_request_context",
     "build_reranker",
     "evaluate_retrieval_cases",
+    "get_vector_store",
     "new_retrieval_trace",
+    "set_mysql_store_for_ingestion",
+    "reset_vector_store_factory",
     "structured_abstention_answer",
     "create_rag_mcp_server",
     "rag_answer_verifier",
     "rag_agent_runner",
     "rag_ingestion_service",
+    "rag_mysql_store",
     "rag_retriever",
     "rag_tool_executor",
     "rag_tool_service",

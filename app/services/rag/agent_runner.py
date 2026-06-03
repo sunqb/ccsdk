@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +70,11 @@ class RagAgentRunner:
         system_prompt: str,
         allowed_tools: list[str] | None = None,
         cwd: str | None = None,
+        space_id: str | None = None,
+        prompt_override: str | None = None,
+        prefetched_results: list[SearchResult] | None = None,
+        prefetched_tool_calls: list[dict[str, Any]] | None = None,
+        on_complete: Callable[[dict[str, Any], RecordingRagToolService], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Primary path: Claude Agent SDK + request-scoped in-process RAG MCP tools.
 
@@ -78,17 +83,22 @@ class RagAgentRunner:
         - 非空列表：仅允许列出的工具（如 ``/rag/stream`` 的 RAG MCP 四件套）
         """
         recording_service = RecordingRagToolService(self.tool_service)
+        if prefetched_results:
+            recording_service.search_results = prefetched_results
+        if prefetched_tool_calls:
+            recording_service.tool_calls.extend(prefetched_tool_calls)
         rag_mcp_server = create_rag_mcp_server(context, tool_service=recording_service)
         answer_parts: list[str] = []
 
         try:
             async for event in agent_service.query_stream(
-                prompt=request.message,
+                prompt=prompt_override or request.message,
                 conversation_id=request.conversation_id,
                 allowed_tools=allowed_tools,
                 max_turns=request.options.max_turns,
                 system_prompt=system_prompt,
                 cwd=cwd or request.cwd,
+                space_id=space_id or request.space_id,
                 model=request.model,
                 base_url=request.base_url,
                 api_key=request.api_key,
@@ -124,17 +134,21 @@ class RagAgentRunner:
         if _should_abstain(request, verification):
             answer = structured_abstention_answer(abstention_reason_labels(verification.reasons))
 
-        yield self.sse_event(
-            "result",
-            {
-                "answer": answer,
-                "citations": [citation.model_dump(by_alias=True) for citation in citations],
-                "requestId": request_id,
-                "mode": "claude_sdk",
-                "toolCalls": recording_service.tool_calls,
-                "verification": verification.model_dump(),
-            },
-        )
+        result_payload = {
+            "answer": answer,
+            "citations": [citation.model_dump(by_alias=True) for citation in citations],
+            "requestId": request_id,
+            "mode": "claude_sdk",
+            "toolCalls": recording_service.tool_calls,
+            "verification": verification.model_dump(),
+        }
+        if on_complete is not None:
+            try:
+                await on_complete(result_payload, recording_service)
+            except Exception as exc:  # noqa: BLE001 - observability callbacks must not break streams
+                logger.warning("RAG stream completion callback failed: %s", exc)
+
+        yield self.sse_event("result", result_payload)
 
     async def stream_direct(
         self,

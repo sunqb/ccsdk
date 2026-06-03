@@ -739,6 +739,228 @@ write metadata store
 4. 对表格、代码、条款类内容尽量保持结构完整。
 5. 保留 page、heading、section 等 metadata。
 
+### 10.5.1 RAG 分块职责边界：应用层分块 vs 向量库分块
+
+本项目推荐采用 **应用层分块，向量库只负责存储与检索** 的设计方式。
+
+完整入库链路如下：
+
+```text
+原始文件
+  ↓
+DocumentParser / MinerU
+  ↓
+ParsedDocument(text + metadata)
+  ↓
+TextChunker.chunk_document
+  ↓
+e_rag_chunk 记录 chunk 事实与映射
+  ↓
+EmbeddingProvider 生成 embedding
+  ↓
+VectorStore.upsert_chunks 写入向量库
+```
+
+#### 10.5.1.1 分块不建议交给向量库完成
+
+向量库的核心职责应是：
+
+- 存储 embedding 向量；
+- 根据向量相似度召回候选 chunk；
+- 支持 metadata filter；
+- 返回命中的向量点及其 metadata。
+
+向量库不应承担文档解析和 chunk 切分的主要职责。
+
+原因是 chunk 质量直接影响 RAG 检索和问答效果，而分块策略往往与业务场景强相关。应用层分块可以更好地控制以下信息：
+
+- 标题层级；
+- 段落边界；
+- 表格边界；
+- 代码块边界；
+- 列表结构；
+- PDF 页码；
+- chunk overlap；
+- parent chunk / child chunk；
+- 文档、文件集、知识库、租户等业务 metadata；
+- startOffset / endOffset 等原文定位信息。
+
+如果将分块交给向量库，分块过程通常会变成黑盒，后续在检索效果优化、问题排查、引用溯源和跨向量库迁移时都会受到限制。
+
+#### 10.5.1.2 应用层分块的优势
+
+应用层可以根据不同文档类型使用不同分块策略，例如：
+
+- Markdown 按标题和段落切分；
+- PDF 按页码、标题、段落、表格结构切分；
+- FAQ 按问答对切分；
+- 代码文档按函数、类、标题层级切分；
+- 长文档使用 parent-child chunk 策略。
+
+应用层分块后，可以清晰追踪：
+
+```text
+原始文件
+  ↓
+解析文本
+  ↓
+chunk 列表
+  ↓
+embedding
+  ↓
+向量库 point
+```
+
+当检索效果不符合预期时，可以定位问题属于：
+
+- 文件解析质量问题；
+- chunk 太大；
+- chunk 太小；
+- overlap 不合理；
+- 标题 metadata 缺失；
+- embedding 模型不合适；
+- 向量库 metadata filter 不正确；
+- rerank 策略不理想。
+
+如果分块由向量库内部完成，中间过程不透明，排查难度会明显增加。
+
+#### 10.5.1.3 跨向量库适配与权限隔离
+
+本项目的向量库应作为可替换存储后端，未来可能接入 local、Chroma、Qdrant、Milvus、pgvector、Elasticsearch dense_vector、OpenSearch 或云厂商向量库。
+
+如果分块逻辑在业务服务层，向量库只负责存储和检索，则切换向量库时无需重写分块逻辑。如果依赖某个向量库或托管知识库平台的内部分块能力，系统容易与具体厂商绑定，后续迁移成本较高。
+
+企业级 RAG 检索通常不只是向量相似度召回，还需要叠加业务过滤条件，例如 tenantId、ownerId、knowledgeBaseId、fileSetId、sourceFileId、visibility、status、isDelete、文件标签和时间范围。
+
+应用层分块可以保证每个 chunk 都携带完整业务 metadata：
+
+```json
+{
+  "tenantId": "...",
+  "knowledgeBaseId": "...",
+  "fileSetId": "...",
+  "sourceFileId": "...",
+  "chunkId": "...",
+  "headingPath": ["第一章", "安装说明"],
+  "pageNumber": 3
+}
+```
+
+向量库检索时只需要基于这些 metadata 进行过滤即可。
+
+#### 10.5.1.4 `e_rag_chunk` 的定位
+
+`e_rag_chunk` 不是执行分块逻辑的地方，而是业务数据库中的 chunk 事实表 / 映射表。
+
+它主要用于记录：
+
+- 业务侧 chunk ID；
+- chunk 与文件集的关系；
+- chunk 与知识库的关系；
+- chunk 与来源文件的关系；
+- chunk 序号；
+- chunk 文本；
+- token 数量；
+- chunk metadata；
+- embedding provider；
+- embedding model；
+- embedding dimension；
+- vector provider；
+- vector collection；
+- vector namespace；
+- vector id。
+
+因此，`e_rag_chunk` 的核心职责是建立：
+
+```text
+业务 chunk
+  ↔
+向量库 point
+```
+
+之间的对应关系。
+
+推荐写入逻辑为：
+
+```text
+TextChunker.chunk_document
+  ↓
+生成 chunk_id / chunk_index / chunk_text / metadata
+  ↓
+写入 e_rag_chunk
+  ↓
+生成 embedding
+  ↓
+写入向量库
+  ↓
+回填 vector_provider / vector_collection / vector_namespace / vector_id
+```
+
+其中：
+
+- `chunk_id` 应由业务服务生成，并同时写入数据库和向量库 metadata；
+- `chunk_text` 可根据存储成本选择是否完整保存；
+- embedding 向量本身通常不需要写入 MySQL，可只存放在向量库；
+- `vector_id` 用于在需要时反查向量库中的具体 point；
+- 如果向量库采用统一 collection + metadata filter 的模式，`vector_id` 可以为空，但 `chunk_id` 必须写入向量库 metadata。
+
+#### 10.5.1.5 不推荐的设计与例外场景
+
+不推荐采用以下方式：
+
+```text
+原始文件
+  ↓
+直接交给向量库或托管知识库
+  ↓
+向量库内部解析、分块、embedding、索引
+```
+
+这种方式虽然接入简单，但存在以下问题：
+
+- 分块策略不可控；
+- chunk ID 不稳定；
+- chunk metadata 继承不完整；
+- 难以和业务库中的文件、文件集、知识库建立稳定映射；
+- 难以排查检索效果问题；
+- 难以重建索引；
+- 难以迁移向量库；
+- 难以做 parent-child chunk、页码引用、章节路径引用等高级能力。
+
+以下场景可以考虑使用向量库或托管 RAG 平台的内部分块能力：
+
+1. 仅用于 MVP 快速验证；
+2. 文档类型非常简单，例如纯文本；
+3. 不需要复杂权限、租户隔离和引用溯源；
+4. 接受平台黑盒能力；
+5. 接受后续向量库迁移成本；
+6. 使用的是完整托管知识库产品，而不是自建 RAG 入库链路。
+
+但对于本项目当前设计，不建议采用该模式。
+
+#### 10.5.1.6 项目推荐结论
+
+本项目推荐明确采用：
+
+```text
+应用层分块为主，向量库只负责存储与检索。
+```
+
+职责划分如下：
+
+| 模块 | 职责 |
+|---|---|
+| DocumentParser / MinerU | 将原始文件解析为结构化文本和 metadata |
+| TextChunker | 根据业务策略生成 chunk |
+| e_rag_chunk | 保存 chunk 事实、metadata 和向量库映射关系 |
+| EmbeddingProvider | 为 chunk 文本生成 embedding |
+| VectorStore | 存储 embedding，执行相似度检索和 metadata filter |
+| QA / Retriever | 根据检索结果组织上下文并生成回答 |
+
+一句话总结：
+
+> 对企业级、可维护、可排查、可迁移的 RAG 系统来说，分块应放在业务服务层完成；向量库应只承担向量存储、metadata 过滤和相似度检索职责。
+
 ### 10.6 `services/rag/embeddings.py`
 
 Embedding 抽象层：

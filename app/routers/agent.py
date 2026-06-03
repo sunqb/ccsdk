@@ -27,7 +27,8 @@ async def _generate_sse_events(
     allowed_tools: list[str] | None,
     disallowed_tools: list[str] | None,
     max_turns: int | None,
-    cwd: str | None
+    cwd: str | None,
+    space_id: str | None
 ) -> AsyncGenerator[str, None]:
     """生成 SSE 事件流"""
     async for event in agent_service.query_stream(
@@ -37,7 +38,8 @@ async def _generate_sse_events(
         allowed_tools=allowed_tools,
         disallowed_tools=disallowed_tools,
         max_turns=max_turns,
-        cwd=cwd
+        cwd=cwd,
+        space_id=space_id
     ):
         yield event.to_sse()
 
@@ -69,7 +71,8 @@ async def query_agent(request: QueryRequest) -> QueryResponse:
         allowed_tools=request.allowed_tools,
         disallowed_tools=request.disallowed_tools,
         max_turns=request.max_turns,
-        cwd=request.cwd
+        cwd=request.cwd,
+        space_id=request.space_id
     )
 
     return QueryResponse(
@@ -106,7 +109,8 @@ async def query_agent_stream(request: QueryRequest):
             allowed_tools=request.allowed_tools,
             disallowed_tools=request.disallowed_tools,
             max_turns=request.max_turns,
-            cwd=request.cwd
+            cwd=request.cwd,
+            space_id=request.space_id
         ),
         media_type="text/event-stream",
         headers={

@@ -86,11 +86,24 @@ class LocalVectorStore:
         chunks: list[RagChunk],
         embeddings: list[list[float]],
     ) -> None:
-        """Insert or replace chunks and their embeddings."""
+        """Insert or replace chunks and their embeddings.
+
+        写入时校验维度一致性（Layer 3 运行时偏差防护）：
+        如果 embedding 维度与已存储向量不一致，抛出 ValueError。
+        """
         if len(chunks) != len(embeddings):
             raise ValueError("chunks and embeddings length mismatch")
 
         for chunk, embedding in zip(chunks, embeddings):
+            # 校验与已有向量维度一致（核心防护：防止混合不同维度的向量）
+            if self._embeddings:
+                existing_dim = len(next(iter(self._embeddings.values())))
+                if len(embedding) != existing_dim:
+                    raise ValueError(
+                        f"Embedding dimension mismatch: existing vectors are "
+                        f"{existing_dim}-dim, new vector is {len(embedding)}-dim. "
+                        f"Chunk: {chunk.chunk_id}"
+                    )
             self._chunks[chunk.chunk_id] = chunk
             self._embeddings[chunk.chunk_id] = embedding
 
@@ -344,7 +357,18 @@ class LocalVectorStore:
 
     @staticmethod
     def _cosine_similarity(left: list[float], right: list[float]) -> float:
-        if not left or not right or len(left) != len(right):
+        if not left or not right:
+            return 0.0
+        if len(left) != len(right):
+            # Layer 3 运行时偏差防护：维度不匹配时记录告警而非静默返回 0
+            import warnings
+            warnings.warn(
+                f"Cosine similarity dimension mismatch: query={len(left)}-dim, "
+                f"stored={len(right)}-dim. Returning 0.0. "
+                f"This usually means the embedding provider was changed "
+                f"without clearing stored vectors.",
+                stacklevel=2,
+            )
             return 0.0
 
         dot = sum(a * b for a, b in zip(left, right))

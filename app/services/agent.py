@@ -4,6 +4,7 @@ Agent 服务 - 核心 Claude Agent SDK 封装
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 import traceback
@@ -42,6 +43,110 @@ def _is_sdk_control_channel_close_race(error_detail: str) -> bool:
         "ProcessTransport is not ready for writing" in error_detail
         and "CLIConnectionError" in error_detail
     )
+
+
+_MARKDOWN_ASSET_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()([^)]*?)(\))")
+_ASSET_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+    ".mp4",
+    ".mov",
+    ".webm",
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".ogg",
+}
+
+
+def _rewrite_markdown_asset_urls(
+    text: str,
+    base_url: str | None,
+    output_dir: str | None,
+) -> str:
+    """Rewrite relative Markdown asset links to the public output base URL."""
+    if not text or not base_url:
+        return text
+
+    normalized_base_url = base_url.rstrip("/")
+    normalized_output_dir = (output_dir or "").rstrip("/")
+
+    def resolve_relative_path(path_part: str) -> str | None:
+        """Return the relative path to publish, but only for files that exist."""
+        if not normalized_output_dir:
+            return None
+
+        output_root = Path(normalized_output_dir)
+        if path_part.startswith("/"):
+            absolute_path = Path(path_part)
+            try:
+                relative_path = absolute_path.relative_to(output_root)
+            except ValueError:
+                return None
+            return relative_path.as_posix() if absolute_path.exists() else None
+
+        relative_candidate = path_part.lstrip("./")
+        if not relative_candidate or relative_candidate.startswith("../"):
+            return None
+
+        direct_path = output_root / relative_candidate
+        if direct_path.exists():
+            return relative_candidate
+
+        # Skills sometimes emit only the filename while writing under assets/.
+        if "/" not in relative_candidate:
+            assets_path = output_root / "assets" / relative_candidate
+            if assets_path.exists():
+                return f"assets/{relative_candidate}"
+
+            matches = list(output_root.rglob(relative_candidate))
+            if matches:
+                return matches[0].relative_to(output_root).as_posix()
+
+        return None
+
+    def rewrite_url(raw_url: str) -> str:
+        url = raw_url.strip()
+        if not url:
+            return raw_url
+
+        lower_url = url.lower()
+        if lower_url.startswith(("http://", "https://", "data:", "mailto:", "#")):
+            return raw_url
+
+        path_part_match = re.match(r"^([^?#]*)(.*)$", url)
+        if not path_part_match:
+            return raw_url
+
+        path_part = path_part_match.group(1)
+        suffix = path_part_match.group(2)
+        if not path_part:
+            return raw_url
+
+        extension = Path(path_part).suffix.lower()
+        if extension not in _ASSET_EXTENSIONS:
+            return raw_url
+
+        relative_path = resolve_relative_path(path_part)
+        if not relative_path:
+            logger.warning(
+                "[asset-url-rewrite] skip missing asset link: url=%s output_dir=%s",
+                raw_url,
+                normalized_output_dir or "None",
+            )
+            return raw_url
+
+        return f"{normalized_base_url}/{relative_path}{suffix}"
+
+    def replace_match(match: re.Match[str]) -> str:
+        rewritten = rewrite_url(match.group(2))
+        return f"{match.group(1)}{rewritten}{match.group(3)}"
+
+    return _MARKDOWN_ASSET_LINK_RE.sub(replace_match, text)
 
 
 @dataclass
@@ -138,7 +243,8 @@ class AgentService:
             allowed_tools: 允许的工具列表
             disallowed_tools: 禁止的工具列表
             max_turns: 最大对话轮数
-            cwd: 工作目录
+            cwd: 工作目录（显式覆盖）
+            space_id: 用户/租户空间ID，未传 cwd 时自动使用 <WORK_DIR>/spaces/<space_id>/
             system_prompt: 系统提示词
             setting_sources: 设置来源
             model: 覆盖默认模型
@@ -158,10 +264,11 @@ class AgentService:
             virtual_space = virtual_space_manager.prepare(virtual_space_id, session_id=session_id)
             final_cwd = str(virtual_space.root)
         else:
-            # 确定有效工作目录（优先级：请求传入 > 会话已有 > 按 conversationId 自动隔离）
-            # SESSION_ISOLATED_WORKDIR=true 时，未传 cwd 的会话自动使用 <WORK_DIR>/sessions/<conversationId>/
+            # 确定有效工作目录（优先级：cwd > space_id > SESSION_ISOLATED_WORKDIR > WORK_DIR）
             effective_cwd = cwd
-            if not effective_cwd and settings.session_isolated_workdir and session_id:
+            if not effective_cwd and space_id:
+                effective_cwd = str(Path(settings.work_dir) / "spaces" / space_id)
+            elif not effective_cwd and settings.session_isolated_workdir and session_id:
                 effective_cwd = str(Path(settings.work_dir) / "sessions" / session_id)
 
             # 自动创建工作目录（前端传入或自动隔离路径均可能不存在）
@@ -393,6 +500,9 @@ class AgentService:
             env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = effective_model
             env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = effective_model
 
+        resume_id = session.metadata.get("resume_id")
+        output_conversation_id = resume_id if isinstance(resume_id, str) and resume_id else session.id
+
         # 动态注入会话级 CLAUDE_OUTPUT_DIR，实现 Skill 文件输出隔离。
         # 虚拟化模式下产物固定落在虚拟空间 workspace/，避免写入复制出的应用/skills。
         virtual_workspace = session.metadata.get("virtual_space_workspace")
@@ -418,14 +528,16 @@ class AgentService:
                     logger.warning(
                         "CLAUDE_OUTPUT_DIR is outside URL base; keep CLAUDE_OUTPUT_BASE_URL unchanged"
                     )
-        elif base_output_dir and session.id:
-            session_output_dir = str(Path(base_output_dir) / session.id)
+        elif base_output_dir and output_conversation_id:
+            # 文件产物目录必须跟 Claude Code conversation/session id 绑定；spaceId 只用于 cwd 隔离。
+            # 已续聊时优先使用 metadata.resume_id（Claude Code session_id），否则回退到本服务 session.id。
+            session_output_dir = str(Path(base_output_dir) / output_conversation_id)
             Path(session_output_dir).mkdir(parents=True, exist_ok=True)
             env["CLAUDE_OUTPUT_DIR"] = session_output_dir
             # 同步追加 session.id 到 BASE_URL，保证 Skill 拼出的展示 URL 与文件路径一致
             base_output_url = env.get("CLAUDE_OUTPUT_BASE_URL", "")
             if base_output_url:
-                env["CLAUDE_OUTPUT_BASE_URL"] = base_output_url.rstrip("/") + "/" + session.id
+                env["CLAUDE_OUTPUT_BASE_URL"] = base_output_url.rstrip("/") + "/" + output_conversation_id
 
         # 调试日志
         logger.info("="*50)
@@ -438,6 +550,11 @@ class AgentService:
         logger.info(f"  effective_base_url: {effective_base_url}")
         logger.info(f"  effective_model: {effective_model}")
         logger.info(f"  work_dir: {settings.work_dir}")
+        logger.info(f"  service_session_id: {session.id}")
+        logger.info(f"  resume_id: {resume_id or 'None'}")
+        logger.info(f"  output_conversation_id: {output_conversation_id}")
+        logger.info(f"  CLAUDE_OUTPUT_DIR: {env.get('CLAUDE_OUTPUT_DIR') or 'None'}")
+        logger.info(f"  CLAUDE_OUTPUT_BASE_URL: {env.get('CLAUDE_OUTPUT_BASE_URL') or 'None'}")
         logger.info("="*50)
 
         # 构建选项
@@ -600,6 +717,8 @@ class AgentService:
         result_text = ""
         streamed_any_text_delta = False
         streamed_any_thinking_delta = False
+        output_base_url = env.get("CLAUDE_OUTPUT_BASE_URL")
+        output_dir = env.get("CLAUDE_OUTPUT_DIR")
 
         try:
             async for message in query(prompt=prompt, options=options):
@@ -621,6 +740,11 @@ class AgentService:
                             if delta_type == "text_delta":
                                 text = delta.get("text", "")
                                 if text:
+                                    text = _rewrite_markdown_asset_urls(
+                                        text,
+                                        output_base_url,
+                                        output_dir,
+                                    )
                                     streamed_any_text_delta = True
                                     if effective_result_mode == "full":
                                         result_text += text
@@ -662,6 +786,11 @@ class AgentService:
                             if streamed_any_text_delta:
                                 continue
                             text = getattr(block, "text", "")
+                            text = _rewrite_markdown_asset_urls(
+                                text,
+                                output_base_url,
+                                output_dir,
+                            )
                             if effective_result_mode == "full":
                                 result_text += text
                             yield AgentEvent(
@@ -702,6 +831,11 @@ class AgentService:
                     subtype = getattr(message, "subtype", None)
                     if subtype == "success":
                         result = getattr(message, "result", "")
+                        result = _rewrite_markdown_asset_urls(
+                            result,
+                            output_base_url,
+                            output_dir,
+                        )
                         session_id = getattr(message, "session_id", None)
 
                         # 保存 session_id 用于后续恢复（file 模式下同步写盘）
