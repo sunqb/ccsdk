@@ -325,13 +325,21 @@ A4: 🛑 用户逐一确认风格一致性 → 锁定 reference_board → 等待
 
 **⚠️ 参考板确认时必须展示负向约束：**
 
-生成每张参考板图片后，向用户展示时**同时展示该风格的关键负向约束**和**排除现代元素明细表**（见 [references/style-presets.md](references/style-presets.md)），让用户确认哪些约束需要保留、哪些需要放松或补充。展示格式：
+生成每张参考板图片后，向用户展示时**同时展示该风格的关键负向约束**和**排除现代元素明细表**（见 [references/style-presets.md](references/style-presets.md)），让用户确认哪些约束需要保留、哪些需要放松或补充。
+
+> ⚠️ **展示 URL 强制规则**：
+> - `{display_url}` 必须来自生成文件后执行 URL 计算命令的 stdout。
+> - 禁止把 `ref_environment.jpg`、`./assets/ref_environment.jpg`、`assets/ref_environment.jpg` 等相对路径直接放进 Markdown。
+> - 若 `CLAUDE_OUTPUT_BASE_URL` 存在，必须输出完整可访问 URL。
+> - 若 `CLAUDE_OUTPUT_BASE_URL` 不存在，才允许回退为本地绝对路径。
+
+展示格式：
 
 ```markdown
 ## 参考板确认：{subject.label}
 
 ### 生成图片
-![参考图]({output_path})
+![参考图]({display_url})
 
 ### 该风格负向约束
 - **风格专属**：{从style-presets.md提取该风格的关键负向约束}
@@ -358,9 +366,9 @@ A4: 🛑 用户逐一确认风格一致性 → 锁定 reference_board → 等待
 
 | # | 类型 | 标签 | 状态 | 预览 |
 |---|------|------|------|------|
-| 1 | 人物 | {角色名}主立像 | ✅ | ![ref](path) |
-| 2 | 人物 | {角色名}姿态 | ✅ | ![ref](path) |
-| 3 | 环境 | {场景名} | ✅ | ![ref](path) |
+| 1 | 人物 | {角色名}主立像 | ✅ | ![ref]({display_url}) |
+| 2 | 人物 | {角色名}姿态 | ✅ | ![ref]({display_url}) |
+| 3 | 环境 | {场景名} | ✅ | ![ref]({display_url}) |
 | ... | ... | ... | ... | ... |
 
 > 请确认以上参考板素材是否可用。如需重新生成某个参考图，请说明。确认后进入 2.2 分镜视频生成。
@@ -383,6 +391,13 @@ node "$SKILLS_ROOT/seedream-ark/scripts/generate_image.js" \
   --prompt "..." \
   --negative-prompt "..." \
   --size 2K --output "$OUTPUT_DIR/assets/ref_env.jpg"
+
+# 每张图片生成后都必须计算展示 URL，并使用 stdout 作为 Markdown 的 {display_url}
+FILE_PATH="$OUTPUT_DIR/assets/ref_env.jpg"
+OUTPUT_DIR="${CLAUDE_OUTPUT_DIR:-$PWD}"
+BASE_URL="${CLAUDE_OUTPUT_BASE_URL:-}"
+REL="${FILE_PATH#$OUTPUT_DIR}"
+if [ -n "$BASE_URL" ]; then echo "${BASE_URL}${REL}"; else echo "$FILE_PATH"; fi
 ```
 
 ### 2.2 分镜视频（依赖2.1用户确认后执行）

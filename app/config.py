@@ -201,6 +201,12 @@ class Settings:
     rag_rerank_base_url: str | None = field(
         default_factory=lambda: os.getenv("RAG_RERANK_BASE_URL")
     )
+    rag_rerank_model: str = field(
+        default_factory=lambda: os.getenv("RAG_RERANK_MODEL", "bge-reranker-v2-m3")
+    )
+    rag_rerank_api_key: str | None = field(
+        default_factory=lambda: os.getenv("RAG_RERANK_API_KEY")
+    )
     rag_verification_mode: str = field(
         default_factory=lambda: os.getenv("RAG_VERIFICATION_MODE", "standard").strip().lower()
     )
