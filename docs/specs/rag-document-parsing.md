@@ -50,7 +50,7 @@ MinerU 更适合作为生产解析服务：
 建议配置：
 
 ```text
-RAG_PARSER_PROVIDER=mineru
+FILE_PARSER_PROVIDER=mineru
 MINERU_BASE_URL=https://mineru.internal.example
 MINERU_API_KEY=
 MINERU_TIMEOUT_SECONDS=120

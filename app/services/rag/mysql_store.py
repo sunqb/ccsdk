@@ -1,7 +1,7 @@
 """
 RAG MySQL 持久化存储。
 
-当 RAG_DB_DSN 配置时，知识库元数据写入 MySQL 结构化表；
+当 DB_DSN 配置时，知识库元数据写入 MySQL 结构化表；
 否则回退到 SQLite JSON snapshot。
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ from ...database import (
     ERagFileSet,
     ERagIngestionJob,
     ERagKnowledgeBase,
+    ERagParsedContent,
     ERagProviderHealth,
     ERagQueryLog,
     ERagToolCallLog,
@@ -33,8 +34,33 @@ from ...database import (
 from .chunker import RagChunk
 
 
+_PARSED_FILE_STATUS_TO_INT = {
+    "pending": 1,
+    "uploaded": 1,
+    "parsing": 1,
+    "ready": 2,
+    "failed": 3,
+}
+_PARSED_FILE_STATUS_FROM_INT = {1: "parsing", 2: "ready", 3: "failed"}
+
+
+def _parsed_file_status_to_int(status: str) -> int:
+    return _PARSED_FILE_STATUS_TO_INT.get(status, 1)
+
+
+def _parsed_file_status_from_int(status: int) -> str:
+    return _PARSED_FILE_STATUS_FROM_INT.get(status, "parsing")
+
+
 class RagMySqlStore:
     """MySQL 持久化存储 for RAG knowledge base metadata."""
+
+    def __init__(self) -> None:
+        # Local/dev fallback used when DB_DSN is not configured. Production
+        # still uses MySQL as the source of truth via get_session_factory().
+        self._memory_file_sets: dict[str, dict[str, Any]] = {}
+        self._memory_parsed_files: dict[str, list[dict[str, Any]]] = {}
+        self._memory_parsed_contents: dict[str, dict[str, Any]] = {}
 
     async def save_knowledge_base(
         self,
@@ -287,9 +313,28 @@ class RagMySqlStore:
         metadata: dict | None = None,
         expires_time: datetime | None = None,
         create_by: str | None = None,
+        parse_only: int | None = None,
     ) -> None:
         factory = get_session_factory()
         if factory is None:
+            now = datetime.now(UTC)
+            self._memory_file_sets[file_set_id] = {
+                "file_set_id": file_set_id,
+                "conversation_id": conversation_id,
+                "status": status,
+                "indexed_chunks": indexed_chunks,
+                "total_chunks": total_chunks,
+                "temporary": temporary,
+                "knowledge_base_id": knowledge_base_id,
+                "tenant_id": tenant_id,
+                "owner_id": owner_id,
+                "api_key_id": api_key_id,
+                "metadata": metadata or {},
+                "expires_time": expires_time,
+                "created_at": now,
+                "updated_at": now,
+                "parse_only": 1 if parse_only is None else int(parse_only),
+            }
             return
         now = datetime.now(UTC)
         from ...database import rag_status_to_int
@@ -300,6 +345,7 @@ class RagMySqlStore:
             indexed_chunks=indexed_chunks,
             total_chunks=total_chunks,
             temporary=1 if temporary else 2,
+            parse_only=1 if parse_only is None else int(parse_only),
             knowledge_base_id=knowledge_base_id,
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -327,10 +373,27 @@ class RagMySqlStore:
         knowledge_base_id: str | None = None,
         metadata: dict | None = None,
         update_by: str | None = None,
+        parse_only: int | None = None,
     ) -> None:
         """Update file-set status and counters in MySQL."""
         factory = get_session_factory()
         if factory is None:
+            row = self._memory_file_sets.get(file_set_id)
+            if row is not None:
+                row["status"] = status
+                row["updated_at"] = datetime.now(UTC)
+                if indexed_chunks is not None:
+                    row["indexed_chunks"] = indexed_chunks
+                if total_chunks is not None:
+                    row["total_chunks"] = total_chunks
+                if temporary is not None:
+                    row["temporary"] = temporary
+                if knowledge_base_id is not None:
+                    row["knowledge_base_id"] = knowledge_base_id
+                if metadata is not None:
+                    row["metadata"] = metadata
+                if parse_only is not None:
+                    row["parse_only"] = int(parse_only)
             return
 
         values: dict[str, Any] = {
@@ -348,6 +411,8 @@ class RagMySqlStore:
             values["knowledge_base_id"] = knowledge_base_id
         if metadata is not None:
             values["metadata_json"] = metadata
+        if parse_only is not None:
+            values["parse_only"] = int(parse_only)
 
         async with factory() as session:
             await session.execute(
@@ -357,11 +422,208 @@ class RagMySqlStore:
             )
             await session.commit()
 
+    # ========================================================================
+    # 纯文件问答（parse-only）相关方法
+    # ========================================================================
+
+    async def save_parsed_content(
+        self,
+        *,
+        parsed_content_id: str,
+        md5: str,
+        file_size: int,
+        parser: str,
+        parsed_text: str | None,
+        parser_version: str | None = None,
+        parser_config_hash: str | None = None,
+        mime_type: str | None = None,
+        status: str = "ready",
+        error_code: str | None = None,
+        error_message: str | None = None,
+        metadata: dict | None = None,
+        create_by: str | None = None,
+    ) -> None:
+        """Persist reusable parse-only content cache."""
+        factory = get_session_factory()
+        if factory is None:
+            now = datetime.now(UTC)
+            self._memory_parsed_contents[parsed_content_id] = {
+                "parsed_content_id": parsed_content_id,
+                "md5": md5,
+                "file_size": file_size,
+                "parser": parser,
+                "parser_version": parser_version,
+                "parser_config_hash": parser_config_hash,
+                "mime_type": mime_type,
+                "parsed_text": parsed_text or "",
+                "status": status,
+                "error_code": error_code,
+                "error_message": error_message,
+                "metadata": metadata or {},
+                "created_at": now,
+                "updated_at": now,
+            }
+            return
+        now = datetime.now(UTC)
+        row = ERagParsedContent(
+            parsed_content_id=parsed_content_id,
+            md5=md5,
+            file_size=file_size,
+            parser=parser,
+            parser_version=parser_version,
+            parser_config_hash=parser_config_hash,
+            mime_type=mime_type,
+            parsed_text=parsed_text,
+            status=_parsed_file_status_to_int(status),
+            error_code=error_code,
+            error_message=error_message,
+            metadata_json=metadata or {},
+            create_by=create_by,
+            create_time=now,
+            update_by=create_by,
+            update_time=now,
+            is_delete=1,
+        )
+        async with factory() as session:
+            session.add(row)
+            await session.commit()
+
+    async def get_parsed_content_by_cache_key(
+        self,
+        md5: str,
+        *,
+        file_size: int,
+        parser: str,
+        parser_version: str | None = None,
+        parser_config_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return ready parsed content for md5 + size + parser cache key."""
+        factory = get_session_factory()
+        if factory is None:
+            for row in self._memory_parsed_contents.values():
+                if (
+                    row.get("md5") == md5
+                    and int(row.get("file_size") or 0) == file_size
+                    and row.get("parser") == parser
+                    and (row.get("parser_version") or "") == (parser_version or "")
+                    and (row.get("parser_config_hash") or "") == (parser_config_hash or "")
+                    and row.get("status") == "ready"
+                    and row.get("parsed_text")
+                ):
+                    return dict(row)
+            return None
+        async with factory() as session:
+            result = await session.execute(
+                select(ERagParsedContent)
+                .where(
+                    and_(
+                        ERagParsedContent.md5 == md5,
+                        ERagParsedContent.file_size == file_size,
+                        ERagParsedContent.parser == parser,
+                        func.coalesce(ERagParsedContent.parser_version, "") == (parser_version or ""),
+                        func.coalesce(ERagParsedContent.parser_config_hash, "") == (parser_config_hash or ""),
+                        ERagParsedContent.status == _parsed_file_status_to_int("ready"),
+                        ERagParsedContent.parsed_text.is_not(None),
+                        ERagParsedContent.parsed_text != "",
+                        ERagParsedContent.is_delete == 1,
+                    )
+                )
+                .order_by(ERagParsedContent.id.desc())
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            return self._parsed_content_row_to_dict(row) if row is not None else None
+
+    async def get_parsed_files_by_set(self, file_set_id: str) -> list[dict[str, Any]]:
+        """Return uploaded files joined with ready reusable parsed content."""
+        factory = get_session_factory()
+        if factory is None:
+            results: list[dict[str, Any]] = []
+            for row in self._memory_parsed_files.get(file_set_id, []):
+                content = self._memory_parsed_contents.get(str(row.get("parsed_content_id")))
+                if not content or content.get("status") != "ready" or not content.get("parsed_text"):
+                    continue
+                results.append({**content, **row, "metadata": content.get("metadata") or {}})
+            return results
+        async with factory() as session:
+            result = await session.execute(
+                select(ERagFile, ERagParsedContent)
+                .join(
+                    ERagParsedContent,
+                    ERagFile.parsed_content_id == ERagParsedContent.parsed_content_id,
+                )
+                .where(
+                    and_(
+                        ERagFile.file_set_id == file_set_id,
+                        ERagFile.status == rag_status_to_int("ready"),
+                        ERagFile.is_delete == 1,
+                        ERagParsedContent.status == _parsed_file_status_to_int("ready"),
+                        ERagParsedContent.is_delete == 1,
+                    )
+                )
+                .order_by(ERagFile.id.asc())
+            )
+            rows = result.all()
+            return [
+                {
+                    "file_id": file_row.file_id,
+                    "file_set_id": file_row.file_set_id,
+                    "filename": file_row.filename,
+                    "mime_type": file_row.mime_type or content_row.mime_type,
+                    "file_size": file_row.file_size,
+                    "parsed_content_id": content_row.parsed_content_id,
+                    "md5": content_row.md5,
+                    "parser": content_row.parser,
+                    "parsed_text": content_row.parsed_text or "",
+                    "status": _parsed_file_status_from_int(content_row.status),
+                    "metadata": content_row.metadata_json or {},
+                }
+                for file_row, content_row in rows
+            ]
+
+    def _parsed_content_row_to_dict(self, row: ERagParsedContent) -> dict[str, Any]:
+        return {
+            "parsed_content_id": row.parsed_content_id,
+            "md5": row.md5,
+            "file_size": row.file_size,
+            "parser": row.parser,
+            "parser_version": row.parser_version,
+            "parser_config_hash": row.parser_config_hash,
+            "mime_type": row.mime_type,
+            "parsed_text": row.parsed_text or "",
+            "status": _parsed_file_status_from_int(row.status),
+            "metadata": row.metadata_json or {},
+        }
+
+    async def get_file_set_parse_only(self, file_set_id: str) -> int | None:
+        """Return parse_only flag (1=RAG mode, 2=parse-only) for a file set.
+
+        Returns None when the file set does not exist.
+        """
+        factory = get_session_factory()
+        if factory is None:
+            row = self._memory_file_sets.get(file_set_id)
+            if row is None:
+                return None
+            return int(row.get("parse_only") or 1)
+        async with factory() as session:
+            result = await session.execute(
+                select(ERagFileSet.parse_only).where(
+                    and_(
+                        ERagFileSet.file_set_id == file_set_id,
+                        ERagFileSet.is_delete == 1,
+                    )
+                )
+            )
+            value = result.scalar_one_or_none()
+            return int(value) if value is not None else None
+
     async def get_file_set_metadata(self, file_set_id: str) -> dict[str, Any] | None:
         """Load file-set metadata from MySQL without depending on process memory."""
         factory = get_session_factory()
         if factory is None:
-            return None
+            row = self._memory_file_sets.get(file_set_id)
+            return dict(row) if row is not None else None
 
         async with factory() as session:
             result = await session.execute(
@@ -401,12 +663,30 @@ class RagMySqlStore:
         mime_type: str | None = None,
         file_size: int = 0,
         status: str = "uploaded",
+        parsed_content_id: str | None = None,
         metadata: dict | None = None,
         create_by: str | None = None,
     ) -> None:
         """Persist uploaded file metadata."""
         factory = get_session_factory()
         if factory is None:
+            now = datetime.now(UTC)
+            rows = self._memory_parsed_files.setdefault(file_set_id, [])
+            rows[:] = [item for item in rows if item.get("file_id") != file_id]
+            rows.append(
+                {
+                    "file_id": file_id,
+                    "file_set_id": file_set_id,
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "file_size": file_size,
+                    "parsed_content_id": parsed_content_id,
+                    "status": status,
+                    "metadata": metadata or {},
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
             return
         now = datetime.now(UTC)
         row = ERagFile(
@@ -415,6 +695,7 @@ class RagMySqlStore:
             filename=filename,
             mime_type=mime_type,
             file_size=file_size,
+            parsed_content_id=parsed_content_id,
             status=rag_status_to_int(status),
             metadata_json=metadata or {},
             create_by=create_by,
@@ -433,6 +714,7 @@ class RagMySqlStore:
         file_id: str,
         status: str,
         mime_type: str | None = None,
+        parsed_content_id: str | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
         metadata: dict | None = None,
@@ -441,6 +723,21 @@ class RagMySqlStore:
         """Update one uploaded file's processing state."""
         factory = get_session_factory()
         if factory is None:
+            for rows in self._memory_parsed_files.values():
+                for row in rows:
+                    if row.get("file_id") != file_id:
+                        continue
+                    row["status"] = status
+                    row["error_code"] = error_code
+                    row["error_message"] = error_message
+                    row["updated_at"] = datetime.now(UTC)
+                    if mime_type is not None:
+                        row["mime_type"] = mime_type
+                    if parsed_content_id is not None:
+                        row["parsed_content_id"] = parsed_content_id
+                    if metadata is not None:
+                        row["metadata"] = metadata
+                    return
             return
 
         values: dict[str, Any] = {
@@ -452,6 +749,8 @@ class RagMySqlStore:
         }
         if mime_type is not None:
             values["mime_type"] = mime_type
+        if parsed_content_id is not None:
+            values["parsed_content_id"] = parsed_content_id
         if metadata is not None:
             values["metadata_json"] = metadata
 

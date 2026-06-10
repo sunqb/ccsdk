@@ -22,6 +22,13 @@ def _env_bool(name: str, default: str = "") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
+
+
 def _default_work_dir() -> str:
     return os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 
@@ -131,7 +138,7 @@ class Settings:
     # 格式：mysql+asyncmy://user:pass@host:port/dbname
     # 为空时回退到 SQLite snapshot
     rag_db_dsn: str = field(
-        default_factory=lambda: os.getenv("RAG_DB_DSN", "")
+        default_factory=lambda: os.getenv("DB_DSN") or os.getenv("RAG_DB_DSN", "")
     )
 
     # RAG MVP 配置
@@ -155,6 +162,10 @@ class Settings:
     )
     rag_direct_max_tokens: int = field(
         default_factory=lambda: int(os.getenv("RAG_DIRECT_MAX_TOKENS", "2048"))
+    )
+    # parseOnly=true 时直接注入解析文本的最大 token 数；为空表示不限制。
+    rag_parse_only_max_tokens: int | None = field(
+        default_factory=lambda: _env_optional_int("RAG_PARSE_ONLY_MAX_TOKENS")
     )
     rag_embedding_provider: str = field(
         default_factory=lambda: os.getenv("RAG_EMBEDDING_PROVIDER", "openai_compatible")
@@ -236,10 +247,14 @@ class Settings:
     rag_pgvector_dsn: str | None = field(default_factory=lambda: os.getenv("RAG_PGVECTOR_DSN"))
     rag_milvus_uri: str | None = field(default_factory=lambda: os.getenv("RAG_MILVUS_URI"))
 
-    # RAG 文档解析器配置
-    # 提供者：local（默认，本地解析 .txt/.md/.pdf/.docx）/ mineru（调用公司 MinerU 服务解析 .pdf/.docx）
-    rag_parser_provider: str = field(
-        default_factory=lambda: os.getenv("RAG_PARSER_PROVIDER", "local").strip().lower()
+    # 文档解析器配置
+    # 提供者：local（默认，本地解析 .txt/.md/.pdf/.docx）/ mineru（调用 MinerU 服务解析 .pdf/.docx）/ kimi（调用 Kimi 文件解析 API）
+    # 注意：文件解析是通用能力，不仅限于 RAG 场景；解析后的文本可用于 RAG 入库或直接注入上下文问答
+    file_parser_provider: str = field(
+        default_factory=lambda: (
+            os.getenv("FILE_PARSER_PROVIDER")
+            or os.getenv("RAG_PARSER_PROVIDER", "local")
+        ).strip().lower()
     )
     mineru_base_url: str | None = field(
         default_factory=lambda: os.getenv("MINERU_BASE_URL")
@@ -252,6 +267,35 @@ class Settings:
     )
     mineru_fallback_to_local: bool = field(
         default_factory=lambda: _env_bool("MINERU_FALLBACK_TO_LOCAL", "false")
+    )
+
+    # Kimi 文件解析器配置
+    kimi_api_key: str | None = field(
+        default_factory=lambda: os.getenv("KIMI_API_KEY")
+    )
+    kimi_base_url: str = field(
+        default_factory=lambda: os.getenv("KIMI_BASE_URL", "https://api.moonshot.cn/v1")
+    )
+    kimi_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("KIMI_TIMEOUT_SECONDS", "120"))
+    )
+    kimi_poll_timeout: float = field(
+        default_factory=lambda: float(os.getenv("KIMI_POLL_TIMEOUT", "300"))
+    )
+    kimi_poll_interval: float = field(
+        default_factory=lambda: float(os.getenv("KIMI_POLL_INTERVAL", "2"))
+    )
+    kimi_poll_max_interval: float = field(
+        default_factory=lambda: float(os.getenv("KIMI_POLL_MAX_INTERVAL", "10"))
+    )
+    kimi_poll_backoff_factor: float = field(
+        default_factory=lambda: float(os.getenv("KIMI_POLL_BACKOFF_FACTOR", "1.5"))
+    )
+    kimi_fallback_to_local: bool = field(
+        default_factory=lambda: _env_bool("KIMI_FALLBACK_TO_LOCAL", "false")
+    )
+    kimi_cleanup_remote_file: bool = field(
+        default_factory=lambda: _env_bool("KIMI_CLEANUP_REMOTE_FILE", "true")
     )
 
     # 默认允许的工具

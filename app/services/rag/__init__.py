@@ -25,6 +25,7 @@ from .ingestion import (
 )
 from .mcp import RAG_MCP_ALLOWED_TOOLS, create_rag_mcp_server
 from .mysql_store import RagMySqlStore, rag_mysql_store
+from .kimi_parser import KimiDocumentParser
 from .parser import ParsedDocument, TextDocumentParser
 from .production import RagConcurrencyGuard, build_provider_info
 from .answer_verifier import RagAnswerVerifier, RagVerificationResult, rag_answer_verifier

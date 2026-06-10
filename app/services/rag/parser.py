@@ -64,7 +64,7 @@ class DocumentParser(Protocol):
 class LocalDocumentParser:
     """Parse supported documents locally into plain text for RAG indexing.
 
-    This is the default local parser used when RAG_PARSER_PROVIDER=local. It
+    This is the default local parser used when FILE_PARSER_PROVIDER=local. It
     handles .txt/.md directly and keeps PDF/DOCX support as a local fallback for
     development or deployments that explicitly choose the local provider.
     """
@@ -328,10 +328,13 @@ class MinerUDocumentParser:
 
 
 class HybridDocumentParser:
-    """Router that delegates to LocalDocumentParser or MinerUDocumentParser.
+    """Router that delegates to LocalDocumentParser, MinerUDocumentParser, or KimiDocumentParser.
 
-    Use this as the single parsing entry point when both local and MinerU
-    backends are needed in the same service.
+    Use this as the single parsing entry point when multiple backends are needed.
+
+    Routing priority:
+      .txt/.md → local (always)
+      other formats → kimi (if configured) → mineru (if configured) → local fallback
     """
 
     def __init__(
@@ -341,9 +344,19 @@ class HybridDocumentParser:
         mineru_api_key: str | None = None,
         mineru_timeout_seconds: float = 120.0,
         mineru_fallback_to_local: bool = False,
+        kimi_base_url: str | None = None,
+        kimi_api_key: str | None = None,
+        kimi_timeout_seconds: float = 120.0,
+        kimi_poll_timeout: float = 300.0,
+        kimi_poll_interval: float = 2.0,
+        kimi_poll_max_interval: float = 10.0,
+        kimi_poll_backoff_factor: float = 1.5,
+        kimi_fallback_to_local: bool = False,
+        kimi_cleanup_remote_file: bool = True,
     ) -> None:
         self.local = LocalDocumentParser()
         self.mineru: MinerUDocumentParser | None = None
+        self.kimi: KimiDocumentParser | None = None
 
         if mineru_base_url:
             self.mineru = MinerUDocumentParser(
@@ -353,10 +366,26 @@ class HybridDocumentParser:
                 fallback_to_local=mineru_fallback_to_local,
             )
 
+        if kimi_api_key:
+            from .kimi_parser import KimiDocumentParser as _KimiParser
+            self.kimi = _KimiParser(
+                base_url=kimi_base_url or "https://api.moonshot.cn/v1",
+                api_key=kimi_api_key,
+                timeout_seconds=kimi_timeout_seconds,
+                poll_timeout=kimi_poll_timeout,
+                poll_interval=kimi_poll_interval,
+                poll_max_interval=kimi_poll_max_interval,
+                poll_backoff_factor=kimi_poll_backoff_factor,
+                fallback_to_local=kimi_fallback_to_local,
+                cleanup_remote_file=kimi_cleanup_remote_file,
+            )
+
     @property
     def supported_extensions(self) -> set[str]:
         exts = set(SUPPORTED_TEXT_EXTENSIONS)
-        if self.mineru:
+        if self.kimi:
+            exts |= self.kimi.supported_extensions
+        elif self.mineru:
             exts |= self.mineru.supported_extensions
         return exts
 
@@ -373,11 +402,15 @@ class HybridDocumentParser:
         if suffix in SUPPORTED_TEXT_EXTENSIONS:
             return self.local.parse_bytes(content, filename=filename, metadata=metadata)
 
+        # Non-text formats: kimi → mineru → error
+        if self.kimi and suffix in self.kimi.supported_extensions:
+            return self.kimi.parse_bytes(content, filename=filename, metadata=metadata)
+
         if suffix in SUPPORTED_MINERU_EXTENSIONS:
             if self.mineru is None:
                 raise ValueError(
                     f"MinerU is not configured but is required for {suffix} files. "
-                    "Set RAG_PARSER_PROVIDER=mineru and MINERU_BASE_URL."
+                    "Set FILE_PARSER_PROVIDER=mineru and MINERU_BASE_URL."
                 )
             return self.mineru.parse_bytes(content, filename=filename, metadata=metadata)
 

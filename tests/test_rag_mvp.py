@@ -623,10 +623,41 @@ def test_rag_direct_tool_schema_is_independent_from_router() -> None:
 
 
 def test_rag_agent_runner_config_keeps_direct_runtime_limits() -> None:
-    runner = RagAgentRunner(config=RagAgentRunnerConfig(direct_timeout_seconds=30, direct_max_tokens=512))
+    runner = RagAgentRunner(
+        config=RagAgentRunnerConfig(
+            direct_timeout_seconds=30,
+            direct_max_tokens=512,
+            parse_only_max_tokens=128,
+        )
+    )
 
     assert runner.config.direct_timeout_seconds == 30
     assert runner.config.direct_max_tokens == 512
+    assert runner.config.parse_only_max_tokens == 128
+
+
+def test_parse_only_context_limit_can_be_disabled() -> None:
+    from app.services.rag.agent_runner import _build_parsed_file_context
+
+    rows = [{"filename": "long.txt", "parsed_text": "x" * 7000}]
+
+    context_text, total_chars, truncated = _build_parsed_file_context(rows, max_tokens=None)
+
+    assert truncated is False
+    assert total_chars == len(context_text)
+    assert "x" * 7000 in context_text
+
+
+def test_parse_only_context_limit_truncates_when_configured() -> None:
+    from app.services.rag.agent_runner import _build_parsed_file_context
+
+    rows = [{"filename": "long.txt", "parsed_text": "x" * 7000}]
+
+    context_text, total_chars, truncated = _build_parsed_file_context(rows, max_tokens=2)
+
+    assert truncated is True
+    assert total_chars == 6
+    assert len(context_text) <= len("以下是用户上传的文件内容，请基于此回答问题：\n") + 6
 
 
 @pytest.mark.asyncio
@@ -977,7 +1008,7 @@ def test_document_parser_protocol_is_runtime_checkable() -> None:
 
 
 def test_ingestion_service_builds_parser_from_config_local(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("app.config.settings.rag_parser_provider", "local")
+    monkeypatch.setattr("app.config.settings.file_parser_provider", "local")
     service = RagIngestionService()
 
     assert isinstance(service.parser, LocalDocumentParser)

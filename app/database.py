@@ -2,7 +2,7 @@
 RAG MySQL 数据库模块。
 
 提供 SQLAlchemy 异步引擎、会话工厂和 ORM 模型定义。
-当 RAG_DB_DSN 配置时使用 MySQL；否则回退到 SQLite snapshot。
+当 DB_DSN 配置时使用 MySQL；否则回退到 SQLite snapshot。
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from sqlalchemy import (
     Index,
     func,
 )
-from sqlalchemy.dialects.mysql import JSON, MEDIUMTEXT
+from sqlalchemy.dialects.mysql import JSON, LONGTEXT, MEDIUMTEXT
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -93,6 +93,7 @@ class ERagFileSet(Base):
     indexed_chunks: Mapped[int] = mapped_column(Integer, default=0, comment="已索引chunk数")
     total_chunks: Mapped[int] = mapped_column(Integer, default=0, comment="总chunk数")
     temporary: Mapped[int] = mapped_column(SmallInteger, default=1, comment="是否临时，1：临时，2：持久")
+    parse_only: Mapped[int] = mapped_column(SmallInteger, default=1, comment="是否仅解析不入库RAG，1：否（默认，走RAG），2：是（纯文件问答）")
     knowledge_base_id: Mapped[str | None] = mapped_column(String(64), comment="关联知识库业务ID")
     tenant_id: Mapped[str | None] = mapped_column(String(64), comment="租户ID")
     owner_id: Mapped[str | None] = mapped_column(String(64), comment="所有者ID")
@@ -126,6 +127,7 @@ class ERagFile(Base):
     storage_type: Mapped[int] = mapped_column(SmallInteger, default=1, comment="存储类型，1：本地，2：对象存储，3：外部URL")
     file_path: Mapped[str | None] = mapped_column(String(1024), comment="原始文件存储地址")
     parsed_file_path: Mapped[str | None] = mapped_column(String(1024), comment="解析后文本文件地址")
+    parsed_content_id: Mapped[str | None] = mapped_column(String(64), comment="parseOnly解析内容ID")
     file_url: Mapped[str | None] = mapped_column(String(1024), comment="文件访问URL")
     status: Mapped[int] = mapped_column(SmallInteger, default=1, comment="状态，1：处理中，2：就绪，3：失败")
     error_code: Mapped[str | None] = mapped_column(String(64), comment="错误码")
@@ -140,7 +142,55 @@ class ERagFile(Base):
     __table_args__ = (
         UniqueConstraint("file_id", name="uk_file_id"),
         Index("idx_file_set_id", "file_set_id"),
+        Index("idx_parsed_content_id", "parsed_content_id"),
         {"comment": "RAG文件表"},
+    )
+
+
+class ERagParsedContent(Base):
+    """RAG 解析内容缓存表（纯文件问答模式专用）。
+
+    同一文件内容在同一 parser/config 下只保存一份 ``parsed_text``。
+    具体上传文件通过 ``ERagFile.parsed_content_id`` 引用本表。
+    """
+
+    __tablename__ = "e_rag_parsed_content"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True, comment="id")
+    parsed_content_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="解析内容业务ID，如pc_xxx")
+    md5: Mapped[str] = mapped_column(String(32), nullable=False, comment="文件内容MD5，用于去重复用")
+    file_size: Mapped[int] = mapped_column(BigInteger, default=0, comment="文件大小，单位字节")
+    parser: Mapped[str] = mapped_column(String(32), nullable=False, comment="解析器：local / mineru / kimi")
+    parser_version: Mapped[str | None] = mapped_column(String(64), comment="解析器版本")
+    parser_config_hash: Mapped[str | None] = mapped_column(String(64), comment="解析配置hash")
+    mime_type: Mapped[str | None] = mapped_column(String(128), comment="MIME类型")
+    parsed_text: Mapped[str | None] = mapped_column(LONGTEXT, comment="解析后文本")
+    status: Mapped[int] = mapped_column(SmallInteger, default=1, comment="状态，1：处理中，2：就绪，3：失败")
+    error_code: Mapped[str | None] = mapped_column(String(64), comment="错误码")
+    error_message: Mapped[str | None] = mapped_column(String(1024), comment="错误信息")
+    metadata_json: Mapped[dict | None] = mapped_column("metadata", JSON, comment="扩展元数据")
+    create_by: Mapped[str | None] = mapped_column(String(64), comment="创建人")
+    create_time: Mapped[datetime | None] = mapped_column(DateTime, comment="创建时间")
+    update_by: Mapped[str | None] = mapped_column(String(64), comment="更新人")
+    update_time: Mapped[datetime | None] = mapped_column(DateTime, comment="更新时间")
+    is_delete: Mapped[int] = mapped_column(SmallInteger, default=1, comment="是否删除，1：正常，2：删除")
+    parser_version_scope: Mapped[str] = mapped_column(String(64), Computed("coalesce(`parser_version`, '')"), comment="归一化解析器版本")
+    parser_config_hash_scope: Mapped[str] = mapped_column(String(64), Computed("coalesce(`parser_config_hash`, '')"), comment="归一化解析配置hash")
+
+    __table_args__ = (
+        UniqueConstraint("parsed_content_id", name="uk_parsed_content_id"),
+        UniqueConstraint(
+            "md5",
+            "file_size",
+            "parser",
+            "parser_version_scope",
+            "parser_config_hash_scope",
+            "is_delete",
+            name="uk_parse_cache_key",
+        ),
+        Index("idx_md5", "md5"),
+        Index("idx_parser", "parser"),
+        {"comment": "RAG解析内容缓存表"},
     )
 
 

@@ -5,9 +5,11 @@ RAG API 路由 - 文件上传、索引状态与流式问答。
 - POST /agent-sdk/rag/stream（推荐）：服务端 allowed_tools=[]，Skills 全开 + RAG MCP。
 - POST /rag/stream：仅 RAG MCP 四件套（RAG_MCP_ALLOWED_TOOLS）。
 """
+import hashlib
 import json
 from time import perf_counter
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -22,6 +24,7 @@ from ..models.rag import (
     KnowledgeBaseInfo,
     KnowledgeBaseListResponse,
     RagAnswer,
+    RagFileInfo,
     RagFileSetStatusResponse,
     RagIngestionJobInfo,
     RagSource,
@@ -91,6 +94,15 @@ def _parse_metadata(metadata: str | None) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="metadata must be a JSON object")
 
     return parsed
+
+
+def _parse_form_bool(value: Any, default: bool = False) -> bool:
+    """Parse bool-like multipart form values without exposing them in OpenAPI schema."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _auth_scope_from_request(request: Request, metadata: dict[str, Any] | None = None) -> dict[str, str | None]:
@@ -249,6 +261,205 @@ async def _record_query_observability(
 
 def _sse_event(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _is_parse_only_file_set(file_set_id: str) -> bool:
+    """Return True iff the file set exists and is in parse-only mode (parse_only=2)."""
+    parse_only = await rag_mysql_store.get_file_set_parse_only(file_set_id)
+    return parse_only == 2
+
+
+def _resolve_file_set_id_from_request(request: RagStreamRequest) -> str | None:
+    """Pick a file_set_id from the request (top-level field or file_set source)."""
+    if request.file_set_id:
+        return request.file_set_id
+    for source in request.get_sources():
+        if source.type == "file_set":
+            return source.id
+    return None
+
+
+def _pick_parser_for_parse_only() -> Any:
+    """Resolve the configured document parser (reuses ingestion service's parser)."""
+    from ..services.rag.parser import TextDocumentParser
+
+    parser = getattr(rag_ingestion_service, "parser", None)
+    if parser is not None:
+        return parser
+    return TextDocumentParser()
+
+
+def _expected_parser_for_parse_only(parser: Any, filename: str) -> str | None:
+    """Best-effort parser name for parse-only MD5 cache lookup.
+
+    The cache key includes parser because identical bytes can produce different
+    parsed text under local / Kimi / MinerU. Keep this as routing-only logic;
+    each parser still owns its provider-specific status/response handling.
+    """
+    from ..services.rag.parser import SUPPORTED_MINERU_EXTENSIONS, SUPPORTED_TEXT_EXTENSIONS
+
+    suffix = Path(filename).suffix.lower()
+    if suffix in SUPPORTED_TEXT_EXTENSIONS:
+        return "local"
+
+    parser_name = parser.__class__.__name__
+    if parser_name in {"LocalDocumentParser", "TextDocumentParser"}:
+        return "local"
+    if parser_name == "KimiDocumentParser":
+        return "kimi"
+    if parser_name == "MinerUDocumentParser":
+        return "mineru"
+
+    kimi_parser = getattr(parser, "kimi", None)
+    if kimi_parser is not None and suffix in getattr(kimi_parser, "supported_extensions", set()):
+        return "kimi"
+    mineru_parser = getattr(parser, "mineru", None)
+    if mineru_parser is not None and suffix in SUPPORTED_MINERU_EXTENSIONS:
+        return "mineru"
+    return None
+
+
+async def _ingest_files_parse_only(
+    *,
+    files: list[IngestFile],
+    conversation_id: str | None,
+    metadata: dict[str, Any],
+    scope: dict[str, str | None],
+) -> UploadFileResponse:
+    """Parse-only ingestion: skip chunk/embed/vector store, store parsed text in MySQL.
+
+    Spec: docs/specs/rag-parse-only-qa.md §3–§5。
+    """
+    parser = _pick_parser_for_parse_only()
+
+    file_set_id = f"fs_{uuid4().hex}"
+    job_id = f"job_{uuid4().hex}"
+
+    # 1) 持久化 file_set (parse_only=2)
+    await rag_mysql_store.save_file_set(
+        file_set_id=file_set_id,
+        conversation_id=conversation_id,
+        status="uploaded",
+        temporary=True,
+        tenant_id=scope.get("tenant_id"),
+        owner_id=scope.get("owner_id"),
+        api_key_id=scope.get("api_key_id"),
+        metadata=metadata,
+        create_by=scope.get("owner_id") or scope.get("api_key_id"),
+        parse_only=2,
+    )
+
+    # 2) 按文件解析并落 e_rag_parsed_content，e_rag_file 仅保存引用关系
+    file_infos: list[RagFileInfo] = []
+    for input_file in files:
+        content_type = (input_file.metadata or {}).get("content_type")
+        file_id = f"file_{uuid4().hex}"
+        file_infos.append(
+            RagFileInfo(
+                fileId=file_id,
+                filename=input_file.filename,
+                mimeType=content_type,
+                size=len(input_file.content),
+                status="parsing",
+            )
+        )
+        await rag_mysql_store.save_file(
+            file_id=file_id,
+            file_set_id=file_set_id,
+            filename=input_file.filename,
+            mime_type=content_type,
+            file_size=len(input_file.content),
+            status="parsing",
+            metadata=metadata,
+            create_by=scope.get("owner_id") or scope.get("api_key_id"),
+        )
+
+        md5 = hashlib.md5(input_file.content).hexdigest()
+        try:
+            expected_parser = _expected_parser_for_parse_only(parser, input_file.filename) or "local"
+            cached = await rag_mysql_store.get_parsed_content_by_cache_key(
+                md5,
+                file_size=len(input_file.content),
+                parser=expected_parser,
+            )
+            if cached and cached.get("parsed_text"):
+                parsed_content_id = str(cached["parsed_content_id"])
+                mime_type: str | None = cached.get("mime_type") or content_type
+            else:
+                document = parser.parse_bytes(
+                    input_file.content,
+                    filename=input_file.filename,
+                    metadata={
+                        **metadata,
+                        "file_set_id": file_set_id,
+                        "fileSetId": file_set_id,
+                        "file_id": file_id,
+                        "fileId": file_id,
+                    },
+                )
+                parsed_text = document.text or ""
+                parser_name = (document.metadata or {}).get("parser") or "local"
+                mime_type = document.mime_type or content_type
+
+                if not parsed_text.strip():
+                    raise ValueError("No parsed text content")
+
+                parsed_content_id = f"pc_{uuid4().hex}"
+                await rag_mysql_store.save_parsed_content(
+                    parsed_content_id=parsed_content_id,
+                    md5=md5,
+                    file_size=len(input_file.content),
+                    parser=parser_name,
+                    mime_type=mime_type,
+                    parsed_text=parsed_text,
+                    status="ready",
+                    metadata=metadata,
+                    create_by=scope.get("owner_id") or scope.get("api_key_id"),
+                )
+            await rag_mysql_store.update_file_status(
+                file_id=file_id,
+                status="ready",
+                mime_type=mime_type,
+                parsed_content_id=parsed_content_id,
+            )
+            file_infos[-1].status = "ready"
+            file_infos[-1].mime_type = mime_type
+        except Exception as exc:  # noqa: BLE001
+            await rag_mysql_store.update_file_status(
+                file_id=file_id,
+                status="failed",
+                error_code="parse_failed",
+                error_message=str(exc),
+            )
+            file_infos[-1].status = "failed"
+            file_infos[-1].error_code = "parse_failed"
+            file_infos[-1].error_message = str(exc)
+            file_infos[-1].error = f"parse_failed: {exc}"
+
+    # 3) 汇总 file_set 状态
+    statuses = [f.status for f in file_infos]
+    if not statuses:
+        aggregate_status = "failed"
+    elif all(s == "ready" for s in statuses):
+        aggregate_status = "ready"
+    elif any(s == "ready" for s in statuses):
+        aggregate_status = "partial_ready"
+    else:
+        aggregate_status = "failed"
+
+    await rag_mysql_store.update_file_set_status(
+        file_set_id=file_set_id,
+        status=aggregate_status,
+        parse_only=2,
+    )
+
+    return UploadFileResponse(
+        fileSetId=file_set_id,
+        jobId=job_id,
+        status=aggregate_status,
+        conversationId=conversation_id,
+        files=file_infos,
+    )
 
 
 def _build_grounded_prompt(message: str, results: list[Any]) -> str:
@@ -480,6 +691,25 @@ async def _generate_rag_stream(
         return
 
     context = build_request_context(request, request_id=request_id)
+
+    # 纯文件问答分流：fileSetId 命中且 parse_only=2 → 走上下文注入路径
+    parse_only_fs_id = _resolve_file_set_id_from_request(request)
+    if parse_only_fs_id and await _is_parse_only_file_set(parse_only_fs_id):
+        async for event in _active_rag_agent_runner().stream_file_context(
+            file_set_id=parse_only_fs_id,
+            message=request.message,
+            conversation_id=request.conversation_id,
+            model=request.model,
+            base_url=request.base_url,
+            api_key=request.api_key,
+            cwd=request.cwd,
+            space_id=request.space_id,
+            request_id=request_id,
+            max_turns=1,
+        ):
+            yield event
+        return
+
     active_runner = _active_rag_agent_runner()
     prompt_override: str | None = None
     prefetched_results: list[Any] | None = None
@@ -565,6 +795,25 @@ async def _generate_rag_agent_stream(
         return
 
     context = build_request_context(request, request_id=request_id)
+
+    # 纯文件问答分流：fileSetId 命中且 parse_only=2 → 走上下文注入路径
+    parse_only_fs_id = _resolve_file_set_id_from_request(request)
+    if parse_only_fs_id and await _is_parse_only_file_set(parse_only_fs_id):
+        async for event in _active_rag_agent_runner().stream_file_context(
+            file_set_id=parse_only_fs_id,
+            message=request.message,
+            conversation_id=request.conversation_id,
+            model=request.model,
+            base_url=request.base_url,
+            api_key=request.api_key,
+            cwd=request.cwd,
+            space_id=request.space_id,
+            request_id=request_id,
+            max_turns=1,
+        ):
+            yield event
+        return
+
     active_runner = _active_rag_agent_runner()
     prompt_override: str | None = None
     prefetched_results: list[Any] | None = None
@@ -643,12 +892,18 @@ async def _generate_rag_agent_stream(
 
 @router.post(
     "/files",
-    summary="上传 RAG 文档并创建 fileSet（可指定知识库名称）",
+    summary="上传文档并创建 fileSet（RAG 入库或 parse-only 纯文件问答）",
     description=(
-        "上传一个或多个文档，服务端会完成解析、切分、embedding 和索引，"
-        "并返回后续问答使用的 fileSetId。如果传了 knowledgeBaseName，"
-        "则自动创建命名知识库。兼容 file（单文件）和 files（多文件）两个 multipart 字段。"
+        "上传一个或多个文档，返回后续问答使用的 fileSetId。\n\n"
+        "**RAG 模式（默认，parseOnly=false）**：服务端会完成 parse → chunk → embedding → vector store，"
+        "适合长期知识库、大文件和多轮检索问答；可配合 knowledgeBaseName 自动创建命名知识库。\n\n"
+        "**parse-only 纯文件问答（parseOnly=true）**：仅解析文件并把 parsed_text 写入 MySQL "
+        "e_rag_parsed_content，e_rag_file 保存 parsed_content_id 引用，跳过 chunk / embedding / vector store；问答时用同一个 fileSetId "
+        "调用 /agent-sdk/rag/stream，服务端会自动进入 mode=parse_only 并直接注入文件上下文。"
+        "该模式依赖 DB_DSN，asyncMode 不生效，也不支持 knowledgeBaseName。\n\n"
+        "兼容 file（单文件）和 files（多文件）两个 multipart 字段。"
     ),
+    response_description="上传结果，包含 fileSetId、jobId、文件状态和可选 knowledgeBase 信息。",
     dependencies=[Depends(verify_api_key)],
 )
 async def upload_rag_files(
@@ -660,6 +915,15 @@ async def upload_rag_files(
             description=(
                 "单文件上传字段。若你的 OpenAPI 工具不能正确识别 files 多文件数组，"
                 "请使用这个字段上传一个文档。"
+            ),
+        ),
+    ] = None,
+    files: Annotated[
+        list[UploadFile] | None,
+        File(
+            description=(
+                "多文件上传字段。multipart/form-data 中可重复传 files 字段；"
+                "也可只用 file 字段上传单个文档。"
             ),
         ),
     ] = None,
@@ -681,7 +945,25 @@ async def upload_rag_files(
     ] = None,
     async_mode: Annotated[
         bool,
-        Form(alias="asyncMode", description="是否异步入库；true 时立即返回 jobId，后台执行入库。"),
+        Form(
+            alias="asyncMode",
+            description=(
+                "是否异步入库。true 时立即返回 jobId，后台执行 RAG 入库；"
+                "parseOnly=true 时该参数会被忽略并改为同步解析。"
+            ),
+        ),
+    ] = False,
+    parse_only: Annotated[
+        bool,
+        Form(
+            alias="parseOnly",
+            description=(
+                "是否启用 parse-only 纯文件问答。false（默认）走完整 RAG 入库；"
+                "true 时仅解析文件，跳过 chunk / embedding / vector store，"
+                "把解析文本存入 e_rag_parsed_content，问答时按 fileSetId 直接注入上下文。"
+                "该模式依赖 DB_DSN；asyncMode 不生效；不支持 knowledgeBaseName。"
+            ),
+        ),
     ] = False,
 ) -> UploadFileResponse:
     """
@@ -703,31 +985,57 @@ async def upload_rag_files(
 
     upload_files: list[UploadFile] = []
     form = await request.form()
+    parse_only = _parse_form_bool(form.get("parseOnly") or form.get("parse_only"), default=parse_only)
     for item in form.getlist("file"):
         if isinstance(item, StarletteUploadFile):
             upload_files.append(item)
     for item in form.getlist("files"):
         if isinstance(item, StarletteUploadFile):
             upload_files.append(item)
-    if not upload_files and file is not None:
-        upload_files.append(file)
+    if not upload_files:
+        if file is not None:
+            upload_files.append(file)
+        if files:
+            upload_files.extend(files)
 
     if not upload_files:
         raise HTTPException(status_code=400, detail="Provide at least one file")
 
+    if parse_only and len(upload_files) > settings.rag_max_upload_files:
+        raise HTTPException(status_code=400, detail=f"Too many files; max is {settings.rag_max_upload_files}")
+
     for upload_file in upload_files:
         content = await upload_file.read()
-        ingest_files.append(
-            IngestFile(
-                filename=upload_file.filename or "uploaded.txt",
-                content=content,
-                metadata={"content_type": upload_file.content_type},
-            )
+        ingest_file = IngestFile(
+            filename=upload_file.filename or "uploaded.txt",
+            content=content,
+            metadata={"content_type": upload_file.content_type},
+        )
+        if parse_only:
+            rag_ingestion_service._validate_file_size(ingest_file)
+        ingest_files.append(ingest_file)
+
+    # spec §5.1: parse-only 模式下 asyncMode 不生效
+    if parse_only and async_mode:
+        async_mode = False
+
+    if knowledge_base_name and parse_only:
+        raise HTTPException(
+            status_code=400,
+            detail="parseOnly mode does not support knowledge base creation",
         )
 
     try:
         async with rag_ingestion_guard.slot():
-            if async_mode:
+            if parse_only:
+                # 纯文件问答：跳过 RAG 入库，仅解析并复用 e_rag_parsed_content
+                upload_response = await _ingest_files_parse_only(
+                    files=ingest_files,
+                    conversation_id=conversation_id,
+                    metadata=scoped_metadata,
+                    scope=scope,
+                )
+            elif async_mode:
                 upload_response = await rag_ingestion_service.enqueue_ingestion_job(
                     ingest_files,
                     conversation_id=conversation_id,

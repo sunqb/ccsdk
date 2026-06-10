@@ -80,7 +80,7 @@ class RagIngestionService:
     SQLite after successful state transitions so local file sets survive process
     restarts.
 
-    When MySQL is configured (RAG_DB_DSN), production metadata is persisted to
+    When MySQL is configured (DB_DSN), production metadata is persisted to
     structured MySQL tables. SQLite is not a production metadata source of truth.
     """
 
@@ -1025,8 +1025,20 @@ class RagIngestionService:
                     self.vector_store.load_records([item for item in raw_chunks if isinstance(item, dict)])
 
     def _build_parser(self) -> DocumentParser:
-        """Build the document parser based on RAG_PARSER_PROVIDER setting."""
-        provider = settings.rag_parser_provider
+        """Build the document parser based on FILE_PARSER_PROVIDER setting."""
+        provider = settings.file_parser_provider
+        if provider == "kimi":
+            return HybridDocumentParser(
+                kimi_base_url=settings.kimi_base_url,
+                kimi_api_key=settings.kimi_api_key,
+                kimi_timeout_seconds=settings.kimi_timeout_seconds,
+                kimi_poll_timeout=settings.kimi_poll_timeout,
+                kimi_poll_interval=settings.kimi_poll_interval,
+                kimi_poll_max_interval=settings.kimi_poll_max_interval,
+                kimi_poll_backoff_factor=settings.kimi_poll_backoff_factor,
+                kimi_fallback_to_local=settings.kimi_fallback_to_local,
+                kimi_cleanup_remote_file=settings.kimi_cleanup_remote_file,
+            )
         if provider == "mineru":
             return HybridDocumentParser(
                 mineru_base_url=settings.mineru_base_url,
@@ -1036,7 +1048,7 @@ class RagIngestionService:
             )
         if provider == "local":
             return LocalDocumentParser()
-        raise ValueError(f"Unsupported RAG_PARSER_PROVIDER: {provider}")
+        raise ValueError(f"Unsupported FILE_PARSER_PROVIDER: {provider}")
 
     @staticmethod
     def _build_embedder() -> EmbeddingProvider:

@@ -30,7 +30,7 @@
 - ✅ **知识库与临时文件**：持久化知识库 + 上传 `.txt/.md/.pdf/.docx` 进行问答
 - ✅ **Claude SDK 统一编排**：RAG 流式走 Agent SDK + request-scoped in-process MCP（推荐 `POST /agent-sdk/rag/stream`）
 - ✅ **检索增强**：混合检索、多 query 扩展、rerank、引用对齐校验与资料不足拒答
-- ✅ **文档解析可配置**：`RAG_PARSER_PROVIDER=local` 本地解析，或 `mineru` 调用 MinerU 解析 PDF/DOCX（可配置回退）
+- ✅ **文档解析可配置**：`FILE_PARSER_PROVIDER=local` 本地解析，或 `mineru`/`kimi` 调用第三方解析（可配置回退）
 - ✅ **运维接口**：知识库 CRUD、索引状态、provider 信息、检索评测与过期清理
 
 ## 快速开始
@@ -223,6 +223,37 @@ curl -N -X POST http://localhost:8000/agent-sdk/rag/stream \
   -d '{"message": "这份文档讲了什么？", "fileSetId": "<上一步返回的 fileSetId>"}'
 ```
 
+**纯文件问答 parse-only（需配置 `DB_DSN`，推荐用于小文件一次性问答）**
+
+`parseOnly=true` 会跳过 chunk / embedding / vector store，只把解析后的纯文本写入 MySQL，问答时直接把文件文本注入上下文。返回流中出现 `event: retrieval` 且 `mode=parse_only` 即表示命中纯文件问答分支。
+
+```bash
+# 如启用了 AGENT_SDK_API_KEY，请追加：-H "X-API-Key: <your-api-key>"
+
+# 1. 上传并仅解析文件
+UPLOAD_RESPONSE=$(curl -sS -X POST http://localhost:8000/rag/files \
+  -F "parseOnly=true" \
+  -F "file=@./docs/specs/rag-parse-only-qa.md;type=text/markdown")
+
+echo "$UPLOAD_RESPONSE"
+FILE_SET_ID=$(python -c 'import json,sys; print(json.load(sys.stdin)["fileSetId"])' <<< "$UPLOAD_RESPONSE")
+
+# 2. 查看解析状态：indexedChunks/totalChunks 应为 0，文件 status 应为 ready
+curl -sS "http://localhost:8000/rag/files/${FILE_SET_ID}/status"
+
+# 3. 基于同一个 fileSetId 问答
+curl -N -X POST http://localhost:8000/agent-sdk/rag/stream \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":\"请概括这个文件的主要内容\",\"fileSetId\":\"${FILE_SET_ID}\"}"
+```
+
+期望首个检索事件类似：
+
+```text
+event: retrieval
+data: {"mode":"parse_only","resultCount":1,...}
+```
+
 ## 核心架构
 
 ### 整体架构
@@ -383,7 +414,7 @@ P2 已完成验证，视为 100%。验证口径如下：
 - ✅ `knowledgeBaseName` 唯一性已按 `tenant_id + owner_id + name + is_delete` 作用域约束。
 - ✅ chunk 与 vector point 可追踪：chunk 记录包含 `vector_provider`、`vector_collection`、`vector_namespace`、`vector_id`、embedding provider/model/dimension 等字段。
 - ✅ 生产路径已接入 MySQL：ingestion 过程会持久化 fileSet、file、chunk、job 状态；query/tool/usage 观测数据也可写入 MySQL。
-- ✅ SQLite snapshot 定位为本地/开发 fallback；生产配置 `RAG_DB_DSN` 后以 MySQL 作为 RAG metadata 单点真值。
+- ✅ SQLite snapshot 定位为本地/开发 fallback；生产配置 `DB_DSN` 后以 MySQL 作为 RAG metadata 单点真值。
 
 ### P3：异步入库队列 TODO
 
@@ -681,6 +712,7 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 
 | 变量名 | 描述 | 默认值 |
 |--------|------|--------|
+| `DB_DSN` | 应用数据库连接串；RAG MySQL metadata store 与 parse-only 文本存储使用。旧变量 `RAG_DB_DSN` 仅作兼容 fallback | 空 |
 | `RAG_ENABLED` | 是否启用 RAG | `false` |
 | `RAG_STORAGE_DIR` | 状态与向量快照目录 | `${WORK_DIR}/rag` |
 | `RAG_VECTOR_PROVIDER` | 向量库 provider。当前真实可用：`local`；`qdrant` / `pgvector` / `milvus` 为预留 | `local` |
@@ -692,8 +724,10 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 | `RAG_RERANK_BASE_URL` | Cross-encoder reranker 服务地址，例如 `http://host:port/v1` | 空 |
 | `RAG_RERANK_MODEL` | Reranker 模型名称，例如 `bge-reranker-v2-m3` | `bge-reranker-v2-m3` |
 | `RAG_RERANK_API_KEY` | Reranker 服务 API Key；为空则不发送 Authorization | 空 |
-| `RAG_PARSER_PROVIDER` | 解析：`local` / `mineru` | `local` |
+| `RAG_PARSE_ONLY_MAX_TOKENS` | `parseOnly=true` 纯文件问答直接注入解析文本的最大 token 数；为空或小于等于 0 表示不限制 | 空 |
+| `FILE_PARSER_PROVIDER` | 解析：`local` / `mineru` / `kimi` | `local` |
 | `MINERU_*` | MinerU 地址、密钥、超时、回退 | 见 `.env.example` |
+| `KIMI_*` | Kimi 地址、密钥、轮询、回退 | 见 `.env.example` |
 | `RAG_ALLOWED_EXTENSIONS` | 允许上传扩展名 | `.txt,.md,.pdf,.docx` |
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | 切分参数 | `1000` / `120` |
 | `RAG_MAX_CONCURRENT_INGESTIONS` | 入库并发上限 | `4` |
@@ -1054,15 +1088,16 @@ RAG 流式问答**统一走 Claude Agent SDK + request-scoped in-process MCP**�
 
 - `app/services/rag/agent_runner.py` 中的 `stream_direct`（Anthropic-compatible `/v1/messages` tool loop）为**内部保留实现**，当前 **HTTP 路由未接入**；流式生产/调试入口均使用 `stream_claude_sdk`。
 - `RAG_DIRECT_TIMEOUT_SECONDS` / `RAG_DIRECT_MAX_TOKENS` 仅在与 `stream_direct` 相关的测试或后续扩展时使用，不影响上述流式接口。
+- `RAG_PARSE_ONLY_MAX_TOKENS` 专用于 `parseOnly=true` 纯文件问答上下文注入；为空或小于等于 0 时不截断。
 
-### RAG 文档解析器配置
+### 文档解析器配置
 
-RAG 上传解析由 `RAG_PARSER_PROVIDER` 决定，配置从 `.env` 读取：
+文件解析由 `FILE_PARSER_PROVIDER` 决定，配置从 `.env` 读取：
 
 | 配置 | 默认值 | 说明 |
 |------|--------|------|
-| `RAG_PARSER_PROVIDER` | `local` | `local` 使用本地依赖解析 `.txt/.md/.pdf/.docx`；`mineru` 使用 Hybrid 路由，`.txt/.md` 本地解析，`.pdf/.docx` 调用 MinerU。 |
-| `MINERU_BASE_URL` | 空 | MinerU 服务地址，例如 `https://mineru.internal.example`。仅 `RAG_PARSER_PROVIDER=mineru` 时需要。 |
+| `FILE_PARSER_PROVIDER` | `local` | `local` 使用本地依赖解析 `.txt/.md/.pdf/.docx`；`mineru` 使用 Hybrid 路由；`kimi` 调用 Kimi 文件解析 API（支持更多格式）。 |
+| `MINERU_BASE_URL` | 空 | MinerU 服务地址，例如 `https://mineru.internal.example`。仅 `FILE_PARSER_PROVIDER=mineru` 时需要。 |
 | `MINERU_API_KEY` | 空 | MinerU Bearer Token；为空则不发送 `Authorization`。 |
 | `MINERU_TIMEOUT_SECONDS` | `120` | 单文件 MinerU 解析超时。 |
 | `MINERU_FALLBACK_TO_LOCAL` | `false` | MinerU 失败时是否回退本地 PDF/DOCX 解析。生产推荐 `false`，让单文件进入失败状态；开发可设为 `true`。 |
@@ -1071,14 +1106,14 @@ RAG 上传解析由 `RAG_PARSER_PROVIDER` 决定，配置从 `.env` 读取：
 开发/本地默认配置：
 
 ```env
-RAG_PARSER_PROVIDER=local
+FILE_PARSER_PROVIDER=local
 RAG_ALLOWED_EXTENSIONS=.txt,.md,.pdf,.docx
 ```
 
 生产 MinerU 配置示例：
 
 ```env
-RAG_PARSER_PROVIDER=mineru
+FILE_PARSER_PROVIDER=mineru
 MINERU_BASE_URL=https://mineru.internal.example
 MINERU_API_KEY=
 MINERU_TIMEOUT_SECONDS=120
@@ -1126,7 +1161,7 @@ RAG_ALLOWED_EXTENSIONS=.txt,.md,.pdf,.docx
 **RAG（启用知识库问答时）**
 - [ ] `RAG_ENABLED=true`
 - [ ] `RAG_STORAGE_DIR` — 与 `WORK_DIR` 一并挂载，避免容器重建丢索引
-- [ ] `RAG_PARSER_PROVIDER=mineru` 时配置 `MINERU_BASE_URL` / `MINERU_API_KEY`
+- [ ] `FILE_PARSER_PROVIDER=mineru` 时配置 `MINERU_BASE_URL` / `MINERU_API_KEY`
 - [ ] `RAG_EMBEDDING_*` — 生产建议使用真实 embedding API，而非仅本地 hash
 
 **Nginx（Skills 生成文件需要前端访问时必须）**

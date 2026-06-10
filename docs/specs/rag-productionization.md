@@ -492,7 +492,7 @@ e_rag_usage_daily
 生产环境推荐：
 
 ```env
-RAG_PARSER_PROVIDER=mineru
+FILE_PARSER_PROVIDER=mineru
 MINERU_BASE_URL=https://mineru.internal.example
 MINERU_API_KEY=
 MINERU_TIMEOUT_SECONDS=120
@@ -1086,6 +1086,55 @@ is_delete = 2
 3. Graph RAG。
 4. 外部知识库注册。
 5. 知识库版本管理。
+
+## 20.5 RAG TODO
+
+待开发功能清单，按登记时间排序：
+
+### 20.5.1 知识库标签（Tags）
+
+**状态**：待开发
+**登记时间**：2026-06-04
+
+为知识库增加标签能力，支持按标签筛选知识库进行问答。
+
+**需求**：
+- 创建知识库时可指定 `tags: ["财务", "报销"]`
+- 列表接口支持按标签过滤 `GET /rag/knowledge-bases?tag=财务`
+- 问答接口支持按标签选择知识库 `knowledgeBaseTags: ["财务"]`
+- 标签写入 Qdrant chunk payload，与现有 scope metadata 对齐
+
+**改动范围**：
+
+| 文件 | 改动点 |
+|------|--------|
+| `app/database.py` | `ERagKnowledgeBase` 新增 `tags` JSON 列 |
+| `app/models/rag.py` | `KnowledgeBaseInfo`、`CreateKnowledgeBaseRequest`、`RagStreamRequest` 新增 tags 字段 |
+| `app/services/rag/mysql_store.py` | `save_knowledge_base` 入参新增 tags；`list_knowledge_bases` 新增 tags 过滤（`JSON_CONTAINS`）；`_kb_row_to_dict` 输出 tags |
+| `app/services/rag/ingestion.py` | `create_knowledge_base` 将 tags 写入 chunk metadata（Qdrant payload） |
+| `app/routers/rag.py` | `_resolve_request_sources` 增加标签解析步骤（查 MySQL → 展开为 sources）；`list_knowledge_bases` 端点增加 tag 查询参数 |
+
+**检索过滤策略**：标签 → 知识库 ID 的映射在来源解析层完成（MySQL 查询），不在 Qdrant filter 层做。`_filter_from_sources` 无需改动。
+
+### 20.5.2 全量知识库问答模式
+
+**状态**：待开发
+**登记时间**：2026-06-04
+
+支持一键检索当前用户权限范围内的全部知识库，无需逐个指定。
+
+**需求**：
+- 请求体新增 `searchAllKnowledgeBases: true`，后端自动展开为当前 scope 下所有 KB 的 sources
+- 与现有 sources 字段并集去重
+- 配置项 `rag_max_all_kb_search` 限制最大知识库数量，防止 Qdrant filter 膨胀
+
+**改动范围**：
+
+| 文件 | 改动点 |
+|------|--------|
+| `app/models/rag.py` | `RagStreamRequest` 新增 `search_all_knowledge_bases` 字段 |
+| `app/routers/rag.py` | `_resolve_request_sources` 增加第 5 步：调 `list_knowledge_bases_async` 展开全部 KB |
+| `app/config.py` | 新增 `rag_max_all_kb_search` 配置项（默认 100） |
 
 ## 21. 最终建议
 
