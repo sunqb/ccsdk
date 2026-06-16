@@ -119,6 +119,9 @@ class Settings:
     agent_sdk_strict_mcp_config: bool = field(
         default_factory=lambda: _env_bool("AGENT_SDK_STRICT_MCP_CONFIG")
     )
+    agent_sdk_include_partial_with_mcp: bool = field(
+        default_factory=lambda: _env_bool("AGENT_SDK_INCLUDE_PARTIAL_WITH_MCP", "true")
+    )
 
     # 服务配置
     host: str = field(default_factory=lambda: os.getenv("HOST", "0.0.0.0"))
@@ -143,7 +146,7 @@ class Settings:
 
     # RAG MVP 配置
     rag_enabled: bool = field(
-        default_factory=lambda: _env_bool("RAG_ENABLED")
+        default_factory=lambda: _env_bool("RAG_ENABLED", "true")
     )
     rag_storage_dir: str = field(
         default_factory=lambda: os.getenv(

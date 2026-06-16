@@ -1113,7 +1113,7 @@ def test_rag_agent_stream_exposes_rag_tools_to_native_agent(
     assert captured.get("allowed_tools") == []
     assert captured["mcp_servers"]
     assert "rag" in captured["mcp_servers"]
-    assert captured["cwd"] == rag_router.settings.work_dir
+    assert captured["cwd"] is None
 
 
 def test_knowledge_base_endpoints_create_list_delete(monkeypatch: pytest.MonkeyPatch) -> None:

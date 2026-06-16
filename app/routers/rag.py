@@ -878,7 +878,7 @@ async def _generate_rag_agent_stream(
             request_id=request_id,
             system_prompt=RAG_AGENT_TOOL_SYSTEM_PROMPT,
             allowed_tools=[],
-            cwd=request.cwd or settings.work_dir,
+            cwd=request.cwd,
             space_id=request.space_id,
             prompt_override=prompt_override,
             prefetched_results=prefetched_results,
@@ -899,7 +899,7 @@ async def _generate_rag_agent_stream(
         "适合长期知识库、大文件和多轮检索问答；可配合 knowledgeBaseName 自动创建命名知识库。\n\n"
         "**parse-only 纯文件问答（parseOnly=true）**：仅解析文件并把 parsed_text 写入 MySQL "
         "e_rag_parsed_content，e_rag_file 保存 parsed_content_id 引用，跳过 chunk / embedding / vector store；问答时用同一个 fileSetId "
-        "调用 /agent-sdk/rag/stream，服务端会自动进入 mode=parse_only 并直接注入文件上下文。"
+        "调用 /agent-sdk/chat/stream 或 /agent-sdk/rag/stream，服务端会自动进入 mode=parse_only 并直接注入文件上下文。"
         "该模式依赖 DB_DSN，asyncMode 不生效，也不支持 knowledgeBaseName。\n\n"
         "兼容 file（单文件）和 files（多文件）两个 multipart 字段。"
     ),

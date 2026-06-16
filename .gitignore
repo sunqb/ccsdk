@@ -117,5 +117,8 @@ dmypy.json
 workspace/
 *.db
 
+# WeChat bot runtime data & credentials (do not commit)
+.wechatbot/
+
 # Data
 .claude/sessions.json

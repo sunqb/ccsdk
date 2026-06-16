@@ -268,20 +268,27 @@ class SessionManager:
         self,
         session_id: Optional[str] = None,
         cwd: Optional[str] = None,
+        *,
+        default_cwd: Optional[str] = None,
     ) -> Session:
         if session_id:
             session = await self.get_session(session_id)
             if session:
-                if cwd and session.cwd != cwd:
+                # 续聊时保持已有 cwd，避免 RAG/普通 Agent 切换时工作目录漂移导致 resume 失效
+                if cwd is not None and session.cwd != cwd:
                     session.cwd = cwd
                     await self._backend.save(session)
+                elif session.cwd is None and default_cwd is not None:
+                    session.cwd = default_cwd
+                    await self._backend.save(session)
                 return session
+            initial_cwd = cwd if cwd is not None else default_cwd
             async with self._lock:
-                session = Session(id=session_id, cwd=cwd)
+                session = Session(id=session_id, cwd=initial_cwd)
                 self._cache[session_id] = session
             await self._backend.save(session)
             return session
-        return await self.create_session(cwd=cwd)
+        return await self.create_session(cwd=cwd if cwd is not None else default_cwd)
 
     async def update_session_metadata(self, session_id: str, metadata: dict) -> None:
         """更新 metadata 并同步到后端"""

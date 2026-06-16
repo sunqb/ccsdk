@@ -2,6 +2,7 @@
 Agent SDK API 路由。
 
 定位：正式对外/前端推荐入口。
+- `/agent-sdk/chat/stream`：统一聊天入口（推荐）；无 RAG 参数时等同 stream，有 fileSetId 等时自动文档问答。
 - `/agent-sdk/stream`：普通 Agent + Skills 对话。
 - `/agent-sdk/rag/stream`：RAG 文件/知识库 + Agent + Skills 对话。
 - `/agent-sdk/history|projects|conversations`：Claude Code 历史与会话辅助查询。
@@ -13,7 +14,7 @@ from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator, Optional
 
 from ..models.rag import RagStreamRequest
-from ..models.request import StreamRequest, HistoryRequest
+from ..models.request import ChatStreamRequest, StreamRequest, HistoryRequest
 from ..services.agent import agent_service
 from ..services.history import history_service
 from ..services.session import session_manager
@@ -77,6 +78,100 @@ async def _generate_sse_stream(
             yield event.to_sse()
 
 
+def _stream_request_params(request: StreamRequest) -> dict:
+    allowed_tools = None
+    disallowed_tools = None
+    max_turns = None
+    if request.options:
+        allowed_tools = request.options.allowed_tools
+        disallowed_tools = request.options.disallowed_tools
+        max_turns = request.options.max_turns
+
+    system_prompt = None
+    if request.system_prompt:
+        if isinstance(request.system_prompt, str):
+            system_prompt = request.system_prompt
+        elif isinstance(request.system_prompt, dict):
+            system_prompt = str(request.system_prompt)
+
+    event_mode = (request.event_mode or settings.agent_sdk_stream_event_mode or "full").strip().lower()
+    if event_mode not in ("full", "text_only"):
+        event_mode = "full"
+
+    result_mode = request.result_mode
+    if event_mode == "text_only":
+        result_mode = "none"
+
+    return {
+        "prompt": request.get_prompt(),
+        "conversation_id": request.conversation_id,
+        "allowed_tools": allowed_tools,
+        "disallowed_tools": disallowed_tools,
+        "max_turns": max_turns,
+        "system_prompt": system_prompt,
+        "setting_sources": request.setting_sources,
+        "cwd": request.cwd,
+        "space_id": request.space_id,
+        "model": request.model,
+        "base_url": request.base_url,
+        "api_key": request.api_key,
+        "result_mode": result_mode,
+        "event_mode": event_mode,
+    }
+
+
+@router.post("/chat/stream", dependencies=[Depends(verify_api_key)])
+async def agent_sdk_chat_stream(http_request: Request, request: ChatStreamRequest):
+    """
+    【推荐】统一聊天流式入口（Agent + Skills + 可选 RAG）。
+
+    适用场景：
+    - 同一前端会话中交替使用生图/Skills 与普通对话。
+    - 用户上传文档后，在同一接口传入 `fileSetId` 即可文档问答，无需切换 `/agent-sdk/rag/stream`。
+
+    路由规则：
+    - 未传 `fileSetId` / `knowledgeBaseId` / `sources` / `knowledgeBaseName(s)`：行为等同 `/agent-sdk/stream`。
+    - 传入上述任一 RAG 参数：行为等同 `/agent-sdk/rag/stream`（RAG MCP + Skills 全开）。
+
+    **同一会话先文档问答再生图**：请始终复用同一个 `conversationId` 调用本接口；
+    服务端会保持 cwd/resume 映射一致，避免切换接口后出现「会话 ID 找不到」。
+
+    消息字段：`userMessage`、`prompt`、`message` 三选一。
+    """
+    prompt = request.get_prompt()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing userMessage (or provide prompt/message)")
+
+    if request.has_rag_context():
+        if not settings.rag_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="RAG is disabled but fileSetId/knowledgeBaseId/sources were provided",
+            )
+        scope = _auth_scope_from_request(http_request)
+        rag_request = request.to_rag_stream_request()
+        return StreamingResponse(
+            _generate_rag_agent_stream(rag_request, scope=scope),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    params = _stream_request_params(request)
+    return StreamingResponse(
+        _generate_sse_stream(**params),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/stream", dependencies=[Depends(verify_api_key)])
 async def agent_sdk_stream(request: StreamRequest):
     """
@@ -112,56 +207,12 @@ async def agent_sdk_stream(request: StreamRequest):
     - settingSources: 设置来源，默认 ["user", "project"]
     - cwd: 工作目录
     """
-    # 获取有效的 prompt
-    prompt = request.get_prompt()
-    if not prompt:
+    params = _stream_request_params(request)
+    if not params["prompt"]:
         raise HTTPException(status_code=400, detail="Missing userMessage (or provide a raw prompt)")
 
-    # 从 options 中提取参数
-    allowed_tools = None
-    disallowed_tools = None
-    max_turns = None
-
-    if request.options:
-        allowed_tools = request.options.allowed_tools
-        disallowed_tools = request.options.disallowed_tools
-        max_turns = request.options.max_turns
-
-    # 处理 systemPrompt
-    system_prompt = None
-    if request.system_prompt:
-        if isinstance(request.system_prompt, str):
-            system_prompt = request.system_prompt
-        elif isinstance(request.system_prompt, dict):
-            # 预设配置，转换为字符串
-            system_prompt = str(request.system_prompt)
-
-    event_mode = (request.event_mode or settings.agent_sdk_stream_event_mode or "full").strip().lower()
-    if event_mode not in ("full", "text_only"):
-        event_mode = "full"
-
-    # text_only 模式：默认不输出最终 result 全量（避免重复/浪费带宽）
-    result_mode = request.result_mode
-    if event_mode == "text_only":
-        result_mode = "none"
-
     return StreamingResponse(
-        _generate_sse_stream(
-            prompt=prompt,
-            conversation_id=request.conversation_id,
-            allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools,
-            max_turns=max_turns,
-            system_prompt=system_prompt,
-            setting_sources=request.setting_sources,
-            cwd=request.cwd,
-            space_id=request.space_id,
-            model=request.model,
-            base_url=request.base_url,
-            api_key=request.api_key,
-            result_mode=result_mode,
-            event_mode=event_mode,
-        ),
+        _generate_sse_stream(**params),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -7,6 +7,7 @@
 ### Agent 与 API
 
 - ✅ **完全兼容 cc-agent-sdk API**：`/agent-sdk/stream`、history、projects、conversations 等核心端点
+- ✅ **统一聊天入口**：`POST /agent-sdk/chat/stream` 在同一接口内支持普通对话与 RAG 文档问答
 - ✅ **SSE 流式响应**：实时推送 Agent 事件；支持 `eventMode`（`full` / `text_only`）与 `resultMode`（`full` / `empty` / `none`）
 - ✅ **请求级配置覆盖**：支持 `model`、`baseURL`、`apiKey`、`cwd`、`allowedTools`、`maxTurns` 等覆盖
 - ✅ **API Key 鉴权**：通过 `AGENT_SDK_API_KEY` 保护接口（未配置时不启用）
@@ -33,6 +34,17 @@
 - ✅ **文档解析可配置**：`FILE_PARSER_PROVIDER=local` 本地解析，或 `mineru`/`kimi` 调用第三方解析（可配置回退）
 - ✅ **运维接口**：知识库 CRUD、索引状态、provider 信息、检索评测与过期清理
 
+## 文档索引
+
+| 文档 | 用途 |
+|------|------|
+| **本文档（README）** | 快速开始、API 摘要、环境变量、部署 |
+| [docs/specs/project-capability-inventory.md](docs/specs/project-capability-inventory.md) | **完整能力清单**（实现状态、测试覆盖、Skills 列表） |
+| [docs/specs/agentscope-migration.md](docs/specs/agentscope-migration.md) | **AgentScope 2.0 迁移计划**（模块映射、分阶段验收） |
+| [docs/specs/agent-plugin-architecture.md](docs/specs/agent-plugin-architecture.md) | Agent 插件架构 |
+| [docs/specs/rag-knowledge-qa.md](docs/specs/rag-knowledge-qa.md) | RAG 整体设计 |
+| [docs/specs/rag-productionization.md](docs/specs/rag-productionization.md) | RAG 产品化路线图（P3/P4） |
+
 ## 快速开始
 
 ### 1. 克隆项目
@@ -42,17 +54,30 @@ git clone https://github.com/sunqb/ccsdk.git
 cd ccsdk
 ```
 
-### 2. 安装依赖
+### 2. 创建并激活虚拟环境（`.venv`）
+
+本项目**必须使用项目根目录下的 `.venv`** 运行，不要直接用 pyenv 全局 Python 或系统 Python。
+
+**首次安装：**
 
 ```bash
-# 使用 uv (推荐)
-uv pip install -r requirements.txt
-
-# 或使用 pip
-pip install -r requirements.txt
+python3.11 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-### 3. 配置环境变量
+激活后 `which python` 应指向 `.../ccsdk/.venv/bin/python`。
+
+### 3. 安装依赖
+
+```bash
+pip install -U pip
+pip install -r requirements.txt
+
+# 或不激活，直接指定 .venv（推荐）
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+### 4. 配置环境变量
 
 ```bash
 cp .env.example .env
@@ -66,54 +91,26 @@ ANTHROPIC_BASE_URL=https://api.anthropic.com  # 可选
 ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
 ```
 
-### 4. 启动服务
+### 5. 启动服务
 
-监听端口由 **uvicorn 命令行** `--host` / `--port` 决定（与 `.env` 中 `HOST` / `PORT` 保持一致即可；当前进程不会自动读取 `PORT` 绑定端口）。
+监听端口由 **uvicorn 命令行** `--host` / `--port` 决定。
 
 ```bash
 source .venv/bin/activate
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
 
-也可以直接指定项目 `.venv` 里的 Python，避免误用 pyenv 全局环境：
-
-```bash
+# 或（推荐）
 .venv/bin/python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-> 注意：本项目本地运行必须使用项目根目录下的 `.venv`。如果未激活 `.venv`，直接使用 pyenv 全局 Python 启动，可能会加载到错误版本的 `claude-agent-sdk`，导致 Claude Code CLI 子进程异常退出。
+| 地址 | 说明 |
+|------|------|
+| http://localhost:8000/docs | Swagger 文档 |
+| http://localhost:8000/health | 健康检查 |
 
-可用以下命令确认当前 Python 与 SDK 是否来自项目 `.venv`：
+> 注意：未激活 `.venv` 可能加载错误版本的 `claude-agent-sdk`。验证：`which python` 与 `python -c "import claude_agent_sdk; print(claude_agent_sdk.__file__)"` 路径应在 `.venv` 下。
 
-```bash
-which python
-python -c "import claude_agent_sdk, importlib.metadata as m; print('sdk file:', claude_agent_sdk.__file__); print('sdk version:', m.version('claude-agent-sdk'))"
-```
-
-正确情况下，路径应指向项目目录，例如：
-
-```text
-/Volumes/samsungssd/code/temp/ccsdk/.venv/bin/python
-/Volumes/samsungssd/code/temp/ccsdk/.venv/lib/python3.11/site-packages/claude_agent_sdk/...
-```
-
-如果日志中出现类似下面的路径，说明当前使用的是 pyenv 全局环境，不是项目 `.venv`：
-
-```text
-Using bundled Claude Code CLI:
-/Users/sunqb/.pyenv/versions/3.11.6/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude
-```
-
-这种情况下可能出现如下错误，尤其是在调用复杂 Skills（图片、视频、TTS、FFmpeg 等流程）时：
-
-```text
-Fatal error in message reader: Command failed with exit code 1
-Error output: Check stderr output for details
-```
-
-简单区分：`pyenv` 管 Python 解释器版本，`.venv` 管当前项目的 pip 依赖版本。本项目遇到 `claude-agent-sdk` 版本问题时，优先检查是否已激活 `.venv`。
-
-### 5. 服务器部署启动
+### 6. 服务器部署启动
 
 服务器部署时同样建议固定使用项目 `.venv`，不要依赖系统 Python、pyenv 全局环境或 PATH 中的 `uvicorn`。生产环境通常不需要 `--reload`。
 
@@ -200,7 +197,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 docker compose up -d --build
 ```
 
-### 6. 测试 API
+### 7. 测试 API
 
 **Agent 流式（需配置 `AGENT_SDK_API_KEY` 时加 `-H "X-API-Key: ..."`）**
 
@@ -372,12 +369,21 @@ curl -X POST http://localhost:8000/agent-sdk/stream \
 
 > 配置了 `AGENT_SDK_API_KEY` 时，受保护接口需请求头 `X-API-Key: <key>`（与 cc-agent-sdk 一致）。
 
+### 系统
+
+| 方法 | 端点 | 描述 |
+|------|------|------|
+| GET | `/` | 服务信息 |
+| GET | `/health` | 健康检查 |
+| GET | `/config` | 运行时配置（model、stream 模式、插件状态） |
+
 ### Agent SDK（cc-agent-sdk 兼容）
 
 | 方法 | 端点 | 描述 |
 |------|------|------|
+| POST | `/agent-sdk/chat/stream` | **推荐统一入口**：Agent + Skills，可选 RAG（传 `fileSetId` 等自动切换） |
 | POST | `/agent-sdk/stream` | Agent 流式查询 (SSE) |
-| POST | `/agent-sdk/rag/stream` | **RAG + Skills 流式问答（推荐）** |
+| POST | `/agent-sdk/rag/stream` | RAG + Skills 流式问答 |
 | GET | `/agent-sdk/history` | 查询会话历史 |
 | GET | `/agent-sdk/projects` | 列出 Claude Code 项目 |
 | GET | `/agent-sdk/conversations` | 列出会话 |
@@ -399,6 +405,9 @@ curl -X POST http://localhost:8000/agent-sdk/stream \
 | GET | `/rag/admin/stats` | 存储与索引统计 |
 | POST | `/rag/admin/evaluate` | 检索评测 |
 | POST | `/rag/admin/cleanup` | 清理过期临时 fileSet |
+| GET | `/rag/admin/jobs/{jobId}` | 查询入库任务状态 |
+| POST | `/rag/admin/jobs/{jobId}/retry` | 重试失败入库任务 |
+| POST | `/rag/admin/jobs/{jobId}/cancel` | 取消未完成入库任务 |
 
 ## RAG 产品化 TODO
 
@@ -437,7 +446,8 @@ P2 已完成验证，视为 100%。验证口径如下：
   - 按 tenant / owner / api_key 维度限制并发 ingestion 数。
 - [ ] 增加死信队列或失败任务归档。
   - 超过最大重试次数后进入 failed/dead-letter 状态，便于人工排查。
-- [ ] 补齐 job 查询、retry、cancel 的端到端测试。
+- [x] job 查询、retry、cancel HTTP API 已落地（见上表）。
+- [ ] 补齐 job 查询、retry、cancel 的**端到端测试**。
 
 ### P4：权限、审计、计费 TODO
 
@@ -593,7 +603,18 @@ WORK_DIR=/data/outputs
 
 启用后，未传 `cwd` 的会话自动使用 `<WORK_DIR>/sessions/<conversationId>/` 作为工作目录。
 
-两种方式优先级：**请求传入的 `cwd` > `SESSION_ISOLATED_WORKDIR` 自动生成 > `WORK_DIR`**。
+**方式 3：按 `spaceId` 隔离**
+
+```json
+{
+  "prompt": "你好",
+  "spaceId": "user-123"
+}
+```
+
+未传 `cwd` 时使用 `<WORK_DIR>/spaces/<spaceId>/`。
+
+工作目录优先级：**请求 `cwd` > `spaceId` > `SESSION_ISOLATED_WORKDIR` + `conversationId` > `WORK_DIR`**。
 
 #### Nginx 静态文件服务
 
@@ -694,6 +715,7 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 | `AGENT_SDK_ADDITIONAL_SETTINGS_JSON` | 注入 `claude --settings` 的 JSON | `{"skipWebFetchPreflight":true}` | 否 |
 | `AGENT_SDK_PERMISSIONS_ALLOW` | `permissions.allow` 规则（逗号分隔） | - | 否 |
 | `AGENT_SDK_MCP_SERVERS_JSON` | 注入外部 MCP servers（JSON） | - | 否 |
+| `AGENT_SDK_INCLUDE_PARTIAL_WITH_MCP` | MCP 场景优先逐 token 流式；失败自动降级整段返回 | `true` | 否 |
 | `HOST` / `PORT` | 服务地址约定（文档/部署对齐用）；实际监听以 uvicorn `--host` / `--port` 为准 | `0.0.0.0` / `8000` | 否 |
 | `WORK_DIR` | Agent 工作目录 | 项目根目录 | 否 |
 | `SKILLS_DIR` | Skills 目录 | `./.claude/skills` | 否 |
@@ -715,7 +737,7 @@ Claude Agent SDK 底层通过 Claude Code CLI 启动 MCP Server。你需要：
 | `DB_DSN` | 应用数据库连接串；RAG MySQL metadata store 与 parse-only 文本存储使用。旧变量 `RAG_DB_DSN` 仅作兼容 fallback | 空 |
 | `RAG_ENABLED` | 是否启用 RAG | `false` |
 | `RAG_STORAGE_DIR` | 状态与向量快照目录 | `${WORK_DIR}/rag` |
-| `RAG_VECTOR_PROVIDER` | 向量库 provider。当前真实可用：`local`；`qdrant` / `pgvector` / `milvus` 为预留 | `local` |
+| `RAG_VECTOR_PROVIDER` | 向量库 provider。当前可用：`local`（SQLite）、`qdrant`；`pgvector` / `milvus` 为预留 | `local` |
 | `RAG_EMBEDDING_PROVIDER` | Embedding provider。支持 `local` / `openai_compatible` | `openai_compatible` |
 | `RAG_EMBEDDING_MODEL` | Embedding 模型名称，例如 `bge-m3:latest` | `text-embedding-3-small` |
 | `RAG_EMBEDDING_BASE_URL` | OpenAI-compatible embedding 服务地址，例如 `http://host:port/v1` | 空 |
@@ -764,7 +786,7 @@ LocalVectorStore 保存 chunk + embedding
 LocalVectorStore 做 cosine similarity 检索
 ```
 
-该组合适合开发验证和单机小规模测试。生产环境建议替换为 Qdrant、Milvus、pgvector 等真实向量数据库。
+该组合适合开发验证和单机小规模测试。生产环境可使用 **Qdrant**（`RAG_VECTOR_PROVIDER=qdrant`，已实现）或 Milvus、pgvector 等。
 
 #### Cross-encoder reranker 与强制知识库检索
 
@@ -823,15 +845,16 @@ curl -N -X POST http://localhost:8000/agent-sdk/rag/stream \
 ```
 ccsdk/
 ├── app/
-│   ├── main.py                 # FastAPI 入口，注册全部路由
+│   ├── main.py                 # FastAPI 入口；插件启停 + 路由挂载
 │   ├── config.py               # 环境变量与 Settings
 │   ├── auth.py                 # X-API-Key 鉴权
+│   ├── plugins/                # Agent 插件（RagPlugin、PluginRegistry）
 │   ├── models/
-│   │   ├── request.py          # Agent 请求模型
+│   │   ├── request.py          # Agent 请求模型（含 ChatStreamRequest）
 │   │   ├── response.py         # 通用响应
 │   │   └── rag.py              # RAG 请求/响应模型
 │   ├── routers/
-│   │   ├── agent_sdk.py        # /agent-sdk/*（含 /rag/stream）
+│   │   ├── agent_sdk.py        # /agent-sdk/*（含 chat/stream、rag/stream）
 │   │   ├── rag.py              # /rag/*
 │   │   ├── skills.py           # /skills/*
 │   │   └── agent.py            # /agent/* 简化 API
@@ -842,11 +865,12 @@ ccsdk/
 │       ├── history.py          # 历史记录读取
 │       └── rag/                # RAG 子系统
 │           ├── ingestion.py    # 上传入库
-│           ├── parser.py       # local / MinerU 文档解析
+│           ├── parser.py       # local / MinerU / Kimi 文档解析
 │           ├── chunker.py      # 文本切分
 │           ├── embeddings.py          # Embedding provider 实现
 │           ├── embedding_factory.py   # Embedding 单点真值与健康检查
-│           ├── vector_store.py        # 本地向量检索与维度一致性防护
+│           ├── vector_store.py        # 本地向量检索
+│           ├── qdrant_vector_store.py # Qdrant 向量库
 │           ├── retriever.py    # 混合检索 + rerank
 │           ├── mcp.py          # in-process RAG MCP 四件套
 │           ├── agent_runner.py # RAG 流式编排（Claude SDK）
@@ -854,14 +878,18 @@ ccsdk/
 │           └── ...
 │
 ├── .claude/
-│   ├── skills/                 # Skills（SDK 自动加载）
+│   ├── skills/                 # Skills（14 个；SDK 自动加载）
 │   └── settings.json           # 项目级 Claude Code 配置
 │
 ├── docs/specs/
-│   ├── rag-knowledge-qa.md     # RAG 整体设计
-│   └── rag-document-parsing.md # 文档解析链路
+│   ├── project-capability-inventory.md  # 完整能力清单
+│   ├── agentscope-migration.md          # AgentScope 2.0 迁移计划
+│   ├── agent-plugin-architecture.md     # 插件架构
+│   ├── rag-knowledge-qa.md              # RAG 整体设计
+│   └── rag-document-parsing.md          # 文档解析链路
 │
-├── tests/                      # pytest（RAG MVP / parser / smoke）
+├── sql/                        # RAG MySQL DDL
+├── tests/                      # pytest
 ├── .env.example
 ├── Dockerfile
 ├── requirements.txt
@@ -1042,6 +1070,7 @@ Loaded 2 skills from ./.claude/skills
 |------|--------------|--------|
 | 语言 | TypeScript | Python |
 | 框架 | Bun | FastAPI |
+| 统一 chat 入口 | — | ✅ `/agent-sdk/chat/stream` |
 | Skills 加载 / 匹配 | ✅ | ✅ |
 | SSE 流式响应 | ✅ | ✅（`eventMode` / `resultMode` 可配） |
 | 会话管理 | ✅ | ✅（`memory` / `file` / `db`） |

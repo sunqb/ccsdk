@@ -42,6 +42,73 @@ def _is_sdk_control_channel_close_race(error_detail: str) -> bool:
     )
 
 
+def _mcp_partial_stream_attempts(has_mcp: bool) -> list[bool]:
+    """Return include_partial_messages values to try for MCP queries."""
+    if not has_mcp:
+        return [True]
+    if not settings.agent_sdk_include_partial_with_mcp:
+        return [False]
+    # Prefer token streaming first; fall back to batch delivery on transport errors.
+    return [True, False]
+
+
+def _is_mcp_partial_transport_error(error_detail: str, stderr_lines: list[str]) -> bool:
+    """Detect MCP + partial streaming transport failures worth retrying without partial."""
+    combined = f"{error_detail}\n" + "\n".join(stderr_lines)
+    if _is_sdk_control_channel_close_race(combined):
+        return True
+    markers = (
+        "ProcessTransport is not ready for writing",
+        "CLIConnectionError",
+    )
+    return any(marker in combined for marker in markers)
+
+
+def resolve_agent_cwd(
+    *,
+    cwd: str | None,
+    space_id: str | None,
+    conversation_id: str | None,
+) -> str:
+    """Resolve Claude Agent working directory consistently across stream/RAG paths."""
+    if cwd:
+        return cwd
+    if space_id:
+        return str(Path(settings.work_dir) / "spaces" / space_id)
+    if settings.session_isolated_workdir and conversation_id:
+        return str(Path(settings.work_dir) / "sessions" / conversation_id)
+    return settings.work_dir
+
+
+def _is_stale_resume_session_error(error_detail: str) -> bool:
+    """Detect Claude Code resume failures when cwd/context changed between requests."""
+    lowered = error_detail.lower()
+    return (
+        "no conversation found with session id" in lowered
+        or "conversation not found" in lowered
+    )
+
+
+def _should_fallback_mcp_partial_stream(
+    *,
+    use_partial: bool,
+    has_mcp: bool,
+    streamed_any_text_delta: bool,
+    result_text: str,
+    error_detail: str,
+    stderr_lines: list[str],
+    attempt_idx: int,
+    total_attempts: int,
+) -> bool:
+    if attempt_idx >= total_attempts - 1:
+        return False
+    if not use_partial or not has_mcp:
+        return False
+    if streamed_any_text_delta or result_text.strip():
+        return False
+    return _is_mcp_partial_transport_error(error_detail, stderr_lines)
+
+
 _MARKDOWN_ASSET_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()([^)]*?)(\))")
 _ASSET_EXTENSIONS = {
     ".jpg",
@@ -252,21 +319,18 @@ class AgentService:
         """
         await self._ensure_initialized()
 
-        # 确定有效工作目录（优先级：cwd > space_id > SESSION_ISOLATED_WORKDIR > WORK_DIR）
-        effective_cwd = cwd
-        if not effective_cwd and space_id:
-            effective_cwd = str(Path(settings.work_dir) / "spaces" / space_id)
-        elif not effective_cwd and settings.session_isolated_workdir and conversation_id:
-            effective_cwd = str(Path(settings.work_dir) / "sessions" / conversation_id)
+        resolved_cwd = resolve_agent_cwd(
+            cwd=cwd,
+            space_id=space_id,
+            conversation_id=conversation_id,
+        )
+        Path(resolved_cwd).mkdir(parents=True, exist_ok=True)
 
-        # 自动创建工作目录（前端传入或自动隔离路径均可能不存在）
-        final_cwd = effective_cwd or settings.work_dir
-        Path(final_cwd).mkdir(parents=True, exist_ok=True)
-
-        # 获取或创建会话
+        # 获取或创建会话；续聊时不因路径解析差异覆盖已有 cwd
         session = await session_manager.get_or_create_session(
             session_id=conversation_id,
-            cwd=final_cwd
+            cwd=cwd,
+            default_cwd=resolved_cwd,
         )
 
         # 构建工具配置
@@ -505,11 +569,13 @@ class AgentService:
             logger.error(f"[CLI stderr] {msg}")
             stderr_lines.append(msg)
 
-        include_partial_messages = not bool(effective_mcp_servers)
+        has_mcp = bool(effective_mcp_servers)
+        partial_attempts = _mcp_partial_stream_attempts(has_mcp)
         logger.info(
-            "[ClaudeAgentOptions] include_partial_messages=%s (mcp_servers=%s)",
-            include_partial_messages,
+            "[ClaudeAgentOptions] partial_attempts=%s (mcp_servers=%s, partial_with_mcp=%s)",
+            partial_attempts,
             list(effective_mcp_servers.keys()),
+            settings.agent_sdk_include_partial_with_mcp,
         )
 
         sdk_allowed_tools = allowed_tools if allowed_tools is not None else []
@@ -525,9 +591,8 @@ class AgentService:
             # 权限模式：bypassPermissions 跳过交互式权限确认
             permission_mode="bypassPermissions",
             # 关键：开启 partial messages，Claude Code CLI 才会输出逐 token 的 stream_event。
-            # 但 SDK MCP server 依赖双向 control channel；partial streaming 在 MCP 场景下
-            # 容易与 close/cancel 时序冲突，导致 ProcessTransport is not ready for writing。
-            include_partial_messages=include_partial_messages,
+            # MCP 场景下若传输层报错，会自动重试 include_partial_messages=False（整段返回）。
+            include_partial_messages=partial_attempts[0],
             settings=injected_settings_str,
             mcp_servers=effective_mcp_servers,
             extra_args=extra_args,
@@ -560,26 +625,16 @@ class AgentService:
                 "append": system_prompt,
             }
 
-        # 如果有会话ID，先修复可能损坏的 .jsonl，再恢复
-        if session.metadata.get("resume_id"):
-            resume_id = session.metadata["resume_id"]
-            result = history_service.repair_session(resume_id)
-            if result["repaired"]:
-                logger.warning(f"[resume] 修复损坏历史 resume_id={resume_id}, patched={result['patched_count']}")
-            options.resume = resume_id
-
-        # 最终调试日志：确认传给 query() 的 options
-        logger.info(f"[FINAL] options.settings = {options.settings}")
-        logger.info(f"[FINAL] options.setting_sources = {options.setting_sources}")
-        logger.info(f"[FINAL] options.cwd = {options.cwd}")
+        output_base_url = env.get("CLAUDE_OUTPUT_BASE_URL")
+        output_dir = env.get("CLAUDE_OUTPUT_DIR")
 
         result_text = ""
         streamed_any_text_delta = False
         streamed_any_thinking_delta = False
-        output_base_url = env.get("CLAUDE_OUTPUT_BASE_URL")
-        output_dir = env.get("CLAUDE_OUTPUT_DIR")
+        cleared_stale_resume = False
 
-        try:
+        async def _run_sdk_query_attempt():
+            nonlocal result_text, streamed_any_text_delta, streamed_any_thinking_delta
             async for message in query(prompt=prompt, options=options):
                 # 通过类名判断消息类型
                 msg_class = type(message).__name__
@@ -752,70 +807,153 @@ class AgentService:
                         conversation_id=session.id
                     )
 
-        except Exception as e:
-            error_detail = _format_exception_tree(e)
-            error_detail += "\n[Traceback]\n" + "".join(
-                traceback.format_exception(type(e), e, e.__traceback__)
-            )
-            if stderr_lines:
-                error_detail += "\n[CLI stderr]\n" + "\n".join(stderr_lines)
-            logger.error(f"[_query_with_sdk] error: {error_detail}")
-
-            # Claude Agent SDK can raise from query.close() after MCP control responses
-            # if the subprocess transport has already closed. Do not surface that race
-            # as a fatal user error when useful output was already produced.
-            if _is_sdk_control_channel_close_race(error_detail):
-                logger.warning(
-                    "[_query_with_sdk] SDK control channel close race detected; "
-                    "streamed_any_text_delta=%s result_text_len=%s",
-                    streamed_any_text_delta,
-                    len(result_text),
-                )
-                if streamed_any_text_delta or result_text:
-                    yield AgentEvent(
-                        type="stream_event",
-                        subtype="end",
-                        data={
-                            "message": "Query completed; ignored SDK control channel close race",
-                            "sdkCloseRaceIgnored": True,
-                        },
-                        conversation_id=session.id,
+        while True:
+            if session.metadata.get("resume_id"):
+                resume_id = session.metadata["resume_id"]
+                result = history_service.repair_session(resume_id)
+                if result["repaired"]:
+                    logger.warning(
+                        f"[resume] 修复损坏历史 resume_id={resume_id}, "
+                        f"patched={result['patched_count']}"
                     )
+                options.resume = resume_id
+            else:
+                options.resume = None
+
+            logger.info(f"[FINAL] options.settings = {options.settings}")
+            logger.info(f"[FINAL] options.setting_sources = {options.setting_sources}")
+            logger.info(f"[FINAL] options.cwd = {options.cwd}")
+            logger.info(f"[FINAL] options.resume = {options.resume or 'None'}")
+
+            retry_without_resume = False
+
+            for attempt_idx, use_partial in enumerate(partial_attempts):
+                if attempt_idx > 0:
+                    logger.warning(
+                        "[_query_with_sdk] MCP partial stream failed; "
+                        "retrying with include_partial_messages=False (batch delivery)"
+                    )
+                options.include_partial_messages = use_partial
+                stderr_lines.clear()
+                result_text = ""
+                streamed_any_text_delta = False
+                streamed_any_thinking_delta = False
+                try:
+                    async for event in _run_sdk_query_attempt():
+                        yield event
+                    return
+                except Exception as e:
+                    error_detail = _format_exception_tree(e)
+                    error_detail += "\n[Traceback]\n" + "".join(
+                        traceback.format_exception(type(e), e, e.__traceback__)
+                    )
+                    if stderr_lines:
+                        error_detail += "\n[CLI stderr]\n" + "\n".join(stderr_lines)
+                    logger.error(f"[_query_with_sdk] error: {error_detail}")
+
+                    if _should_fallback_mcp_partial_stream(
+                        use_partial=use_partial,
+                        has_mcp=has_mcp,
+                        streamed_any_text_delta=streamed_any_text_delta,
+                        result_text=result_text,
+                        error_detail=error_detail,
+                        stderr_lines=stderr_lines,
+                        attempt_idx=attempt_idx,
+                        total_attempts=len(partial_attempts),
+                    ):
+                        logger.warning(
+                            "[_query_with_sdk] suppressing user-visible error; "
+                            "falling back to non-partial MCP delivery"
+                        )
+                        continue
+
+                    if (
+                        not cleared_stale_resume
+                        and _is_stale_resume_session_error(error_detail)
+                        and session.metadata.get("resume_id")
+                        and not streamed_any_text_delta
+                        and not result_text.strip()
+                    ):
+                        cleared_stale_resume = True
+                        old_resume_id = session.metadata["resume_id"]
+                        await session_manager.update_session_metadata(
+                            session.id, {"resume_id": None}
+                        )
+                        logger.warning(
+                            "[_query_with_sdk] stale resume_id=%s cleared; "
+                            "retrying same conversationId without resume",
+                            old_resume_id,
+                        )
+                        retry_without_resume = True
+                        break
+
+                    # Claude Agent SDK can raise from query.close() after MCP control responses
+                    # if the subprocess transport has already closed. Do not surface that race
+                    # as a fatal user error when useful output was already produced.
+                    if _is_sdk_control_channel_close_race(error_detail):
+                        logger.warning(
+                            "[_query_with_sdk] SDK control channel close race detected; "
+                            "streamed_any_text_delta=%s result_text_len=%s",
+                            streamed_any_text_delta,
+                            len(result_text),
+                        )
+                        if streamed_any_text_delta or result_text:
+                            yield AgentEvent(
+                                type="stream_event",
+                                subtype="end",
+                                data={
+                                    "message": "Query completed; ignored SDK control channel close race",
+                                    "sdkCloseRaceIgnored": True,
+                                },
+                                conversation_id=session.id,
+                            )
+                            return
+
+                        yield AgentEvent(
+                            type="error",
+                            data={
+                                "message": "Claude Agent SDK control channel closed before MCP control response was written.",
+                                "code": "sdk_control_channel_close_race",
+                                "recoverable": True,
+                                "detail": error_detail,
+                            },
+                            conversation_id=session.id,
+                        )
+                        return
+
+                    # 历史会话损坏（工具调用中断导致 tool_calls 无对应 tool_result）时，
+                    # 清除 resume_id 让下次请求以新 session 启动，conversationId 保持不变。
+                    if (
+                        "tool_call_ids did not have response messages" in error_detail
+                        and session.metadata.get("resume_id")
+                    ):
+                        old_resume_id = session.metadata["resume_id"]
+                        await session_manager.update_session_metadata(
+                            session.id, {"resume_id": None}
+                        )
+                        logger.warning(
+                            f"[_query_with_sdk] 历史会话损坏，已清除 resume_id={old_resume_id}，"
+                            "下次请求将以新 session 继续"
+                        )
+                        yield AgentEvent(
+                            type="error",
+                            data={
+                                "message": "历史会话因上次中断损坏，已自动重置。请重新发送消息，对话可继续（历史上下文已丢失）。",
+                                "code": "corrupted_session_reset",
+                            },
+                            conversation_id=session.id,
+                        )
+                    else:
+                        yield AgentEvent(
+                            type="error",
+                            data={"message": error_detail},
+                            conversation_id=session.id,
+                        )
                     return
 
-                yield AgentEvent(
-                    type="error",
-                    data={
-                        "message": "Claude Agent SDK control channel closed before MCP control response was written.",
-                        "code": "sdk_control_channel_close_race",
-                        "recoverable": True,
-                        "detail": error_detail,
-                    },
-                    conversation_id=session.id,
-                )
-                return
-
-            # 历史会话损坏（工具调用中断导致 tool_calls 无对应 tool_result）时，
-            # 清除 resume_id 让下次请求以新 session 启动，conversationId 保持不变。
-            # 历史 .jsonl 文件仍保留在磁盘，本次对话上下文丢失但 conversationId 可继续使用。
-            if "tool_call_ids did not have response messages" in error_detail and session.metadata.get("resume_id"):
-                old_resume_id = session.metadata["resume_id"]
-                await session_manager.update_session_metadata(session.id, {"resume_id": None})
-                logger.warning(f"[_query_with_sdk] 历史会话损坏，已清除 resume_id={old_resume_id}，下次请求将以新 session 继续")
-                yield AgentEvent(
-                    type="error",
-                    data={
-                        "message": "历史会话因上次中断损坏，已自动重置。请重新发送消息，对话可继续（历史上下文已丢失）。",
-                        "code": "corrupted_session_reset",
-                    },
-                    conversation_id=session.id
-                )
-            else:
-                yield AgentEvent(
-                    type="error",
-                    data={"message": error_detail},
-                    conversation_id=session.id
-                )
+            if retry_without_resume:
+                continue
+            return
 
     async def query(
         self,

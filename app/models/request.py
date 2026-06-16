@@ -2,7 +2,10 @@
 请求模型定义
 """
 from typing import Optional, Any, Union
+
 from pydantic import BaseModel, Field
+
+from .rag import RagQueryOptions, RagSource, RagStreamRequest
 
 
 class ToolDefinition(BaseModel):
@@ -117,6 +120,88 @@ class StreamRequest(BaseModel):
     def get_prompt(self) -> str:
         """获取有效的 prompt（优先 prompt，其次 userMessage）"""
         return self.prompt or self.user_message or ""
+
+
+class ChatStreamRequest(StreamRequest):
+    """统一聊天流式请求：Agent + Skills，可选附带 RAG 文档/知识库上下文。"""
+
+    message: Optional[str] = Field(
+        None,
+        description="用户消息（userMessage 的别名，兼容 RAG 请求字段）",
+    )
+    file_set_id: Optional[str] = Field(
+        None,
+        alias="fileSetId",
+        description="文件集 ID；传入后自动启用文档问答（RAG MCP + Skills）",
+    )
+    knowledge_base_id: Optional[str] = Field(
+        None,
+        alias="knowledgeBaseId",
+        description="知识库 ID；传入后自动启用知识库问答",
+    )
+    sources: Optional[list[RagSource]] = Field(
+        None,
+        description="显式 RAG 检索来源",
+    )
+    knowledge_base_name: Optional[str] = Field(
+        None,
+        alias="knowledgeBaseName",
+        description="知识库名称",
+    )
+    knowledge_base_names: Optional[list[str]] = Field(
+        None,
+        alias="knowledgeBaseNames",
+        description="多个知识库名称",
+    )
+    rag_options: Optional[RagQueryOptions] = Field(
+        None,
+        alias="ragOptions",
+        description="RAG 检索与回答选项；未传时使用默认值",
+    )
+
+    def get_prompt(self) -> str:
+        return self.prompt or self.user_message or self.message or ""
+
+    def has_rag_context(self) -> bool:
+        if self.sources:
+            return True
+        if self.file_set_id:
+            return True
+        if self.knowledge_base_id:
+            return True
+        return bool(self.get_knowledge_base_names())
+
+    def get_knowledge_base_names(self) -> list[str]:
+        names: list[str] = []
+        if self.knowledge_base_name and self.knowledge_base_name.strip():
+            names.append(self.knowledge_base_name.strip())
+        if self.knowledge_base_names:
+            for name in self.knowledge_base_names:
+                if name and name.strip():
+                    stripped = name.strip()
+                    if stripped not in names:
+                        names.append(stripped)
+        return names
+
+    def to_rag_stream_request(self) -> RagStreamRequest:
+        rag_opts = self.rag_options or RagQueryOptions()
+        if self.options and self.options.max_turns is not None:
+            rag_opts = rag_opts.model_copy(update={"max_turns": self.options.max_turns})
+        return RagStreamRequest(
+            message=self.get_prompt(),
+            conversation_id=self.conversation_id,
+            file_set_id=self.file_set_id,
+            knowledge_base_id=self.knowledge_base_id,
+            sources=self.sources,
+            knowledge_base_name=self.knowledge_base_name,
+            knowledge_base_names=self.knowledge_base_names,
+            options=rag_opts,
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            cwd=self.cwd,
+            space_id=self.space_id,
+        )
 
 
 class HistoryRequest(BaseModel):

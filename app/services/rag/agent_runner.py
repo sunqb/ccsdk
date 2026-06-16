@@ -108,6 +108,7 @@ class RagAgentRunner:
             recording_service.tool_calls.extend(prefetched_tool_calls)
         rag_mcp_server = create_rag_mcp_server(context, tool_service=recording_service)
         answer_parts: list[str] = []
+        service_conversation_id = request.conversation_id
 
         try:
             async for event in agent_service.query_stream(
@@ -124,10 +125,19 @@ class RagAgentRunner:
                 result_mode="full",
                 mcp_servers={"rag": rag_mcp_server},
             ):
+                if event.conversation_id:
+                    service_conversation_id = event.conversation_id
                 text = _extract_agent_delta(event)
                 if text:
                     answer_parts.append(text)
-                    yield self.sse_event("agent_delta", {"text": text, "requestId": request_id})
+                    yield self.sse_event(
+                        "agent_delta",
+                        {
+                            "text": text,
+                            "requestId": request_id,
+                            "conversationId": service_conversation_id,
+                        },
+                    )
                 elif event.type == "error":
                     yield self.sse_event(
                         "error",
@@ -157,6 +167,7 @@ class RagAgentRunner:
             "answer": answer,
             "citations": [citation.model_dump(by_alias=True) for citation in citations],
             "requestId": request_id,
+            "conversationId": service_conversation_id,
             "mode": "claude_sdk",
             "toolCalls": recording_service.tool_calls,
             "verification": verification.model_dump(),
@@ -241,6 +252,7 @@ class RagAgentRunner:
 
         recording_service = RecordingRagToolService(self.tool_service)
         answer_parts: list[str] = []
+        service_conversation_id = conversation_id
 
         try:
             async for event in agent_service.query_stream(
@@ -267,10 +279,19 @@ class RagAgentRunner:
                 result_mode="full",
                 mcp_servers={},
             ):
+                if event.conversation_id:
+                    service_conversation_id = event.conversation_id
                 text = _extract_agent_delta(event)
                 if text:
                     answer_parts.append(text)
-                    yield self.sse_event("agent_delta", {"text": text, "requestId": request_id})
+                    yield self.sse_event(
+                        "agent_delta",
+                        {
+                            "text": text,
+                            "requestId": request_id,
+                            "conversationId": service_conversation_id,
+                        },
+                    )
                 elif event.type == "error":
                     yield self.sse_event(
                         "error",
@@ -289,6 +310,7 @@ class RagAgentRunner:
             "answer": answer,
             "citations": [],
             "requestId": request_id,
+            "conversationId": service_conversation_id,
             "mode": "parse_only",
             "toolCalls": [],
             "verification": None,
