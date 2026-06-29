@@ -161,4 +161,6 @@ def build_reranker(provider: str | None = None) -> RerankerProvider:
 
 
 def _tokenize(text: str) -> list[str]:
-    return [match.group(0).lower() for match in TOKEN_RE.finditer(text)]
+    from .text_processing import tokenize
+
+    return tokenize(text)

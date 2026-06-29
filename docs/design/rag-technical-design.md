@@ -96,6 +96,9 @@ app/services/rag/retriever.py
 app/services/rag/reranker.py
   reranker provider 抽象、本地词法 reranker、HTTP cross-encoder reranker 适配器。
 
+app/services/rag/text_processing.py
+  共享分词模块：jieba 中文分词、中英文停用词过滤、降级兼容。供 keyword 检索和 lexical reranker 使用。
+
 app/services/rag/tools.py
   面向 Agent/MCP 的 request-scoped RAG 工具门面。
 
@@ -242,6 +245,7 @@ RAG_ENABLE_MULTI_QUERY=true
 RAG_RERANK_PROVIDER=local_lexical
 RAG_CHUNK_SIZE=1000
 RAG_CHUNK_OVERLAP=120
+RAG_REMOVE_STOPWORDS=true
 ```
 
 这说明当前方案默认偏向“召回优先”：先拿较大的候选池，再在后续阶段压缩为最终证据。
@@ -414,7 +418,35 @@ query tokens
 
 - 文件中的精确术语；
 - ID、编号、接口名、政策名；
-- 中文单字或英文 token 的直接匹配。
+- 中文词或英文 token 的直接匹配。
+
+#### 9.2.1 分词器（text_processing.py）
+
+分词是关键词检索和 lexical reranker 的前置环节，统一收敛在 `app/services/rag/text_processing.py`，供 `vector_store.py`、`retriever.py`、`reranker.py` 三处调用。
+
+**分词策略：**
+
+| 语言 | 方式 | 说明 |
+|------|------|------|
+| 中文 | **jieba 精确模式** | 词级切分（如"退款政策" → `退款/政策`），而非逐字 |
+| 英文/数字 | 正则按词切分 + 小写 | 保留 `bge-m3`、`v2.m3` 等带连字符/点的术语 |
+| 停用词 | 中英文双语过滤 | 过滤"的/了/是/the/a/…"等高频无意义词 |
+
+**关键设计：**
+
+- **jieba 为可选依赖**：未安装时自动降级为逐字切分（与改造前行为一致），`jieba_available()` 可查询状态；
+- **停用词过滤可配置**：通过环境变量 `RAG_REMOVE_STOPWORDS` 控制（默认 `true` 开启过滤）；
+- **代码级覆盖优先级最高**：`tokenize(text, remove_stopwords=True/False)` 可覆盖配置，用于特殊场景；
+- **CJK 切分带 `lru_cache`**：相同片段不重复分词，降低性能开销。
+
+**改造前后对比（查询"退款政策是什么"）：**
+
+| 方式 | 分词结果 |
+|------|----------|
+| 改造前（正则逐字） | `退/款/政/策/是/什/么` |
+| 改造后（jieba + 停用词） | `退款/政策`（"是/什么"被过滤） |
+
+> 注意：分词器只影响 keyword（BM25）分支和 lexical reranker；向量检索走 BGE-M3 embedding，不受分词影响。
 
 ### 9.3 为什么要 hybrid
 

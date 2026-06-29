@@ -380,7 +380,9 @@ class LocalVectorStore:
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        return [match.group(0).lower() for match in TOKEN_RE.finditer(text)]
+        from .text_processing import tokenize
+
+        return tokenize(text)
 
     @staticmethod
     def _document_frequencies(token_lists: Any) -> Counter[str]:

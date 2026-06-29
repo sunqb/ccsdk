@@ -360,7 +360,9 @@ class RagRetriever:
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        return [match.group(0).lower() for match in TOKEN_RE.finditer(text)]
+        from .text_processing import tokenize
+
+        return tokenize(text)
 
     async def read_chunk(self, chunk_id: str, window: int = 0) -> list[RagChunk]:
         """Read a chunk and optional neighbors from the same source file."""

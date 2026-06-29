@@ -221,6 +221,10 @@ class Settings:
     rag_chunk_overlap: int = field(
         default_factory=lambda: int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
     )
+    # 关键词检索（BM25/lexical）分词时是否过滤停用词；默认开启
+    rag_remove_stopwords: bool = field(
+        default_factory=lambda: _env_bool("RAG_REMOVE_STOPWORDS", "true")
+    )
     rag_max_upload_files: int = field(
         default_factory=lambda: int(os.getenv("RAG_MAX_UPLOAD_FILES", "5"))
     )
